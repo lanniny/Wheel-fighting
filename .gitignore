@@ -1,0 +1,51 @@
+# SolidWorks 文件
+*.SLDPRT
+*.sldprt
+*.SLDASM
+*.sldasm
+*.SLDDRW
+*.slddrw
+
+# SolidWorks 临时和备份文件
+~$*
+*.sldprt.*
+*.sldasm.*
+*.slddrw.*
+
+# SolidWorks 其他文件
+*.STEP
+*.step
+*.STL
+*.stl
+*.IGS
+*.igs
+*.IGES
+*.iges
+
+# 3D打印和CAD导出文件
+*.x_t
+*.x_b
+*.sat
+*.3dxml
+
+# Windows 系统文件
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS 系统文件
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 编辑器和IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 临时文件
+*.tmp
+*.bak
+*.log
