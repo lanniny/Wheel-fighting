@@ -82,14 +82,12 @@ class Tracker:
                 used_tracks.add(tid)
                 result.append(t)
 
-        # 清除长时间丢失的轨迹
-        stale = [tid for tid, tr in self._tracks.items()
-                 if tid not in used_tracks and tr['lost'] >= self.max_lost]
-        for tid in stale:
-            del self._tracks[tid]
-        for tid, tr in self._tracks.items():
+        # 清除长时间丢失的轨迹, 并递增未匹配track的lost计数
+        for tid, tr in list(self._tracks.items()):
             if tid not in used_tracks:
                 tr['lost'] += 1
+                if tr['lost'] > self.max_lost:
+                    del self._tracks[tid]
 
         return result
 
@@ -111,10 +109,14 @@ class ColorDetector:
         """
         关闭摄像头自动曝光和自动白平衡，减少赛场灯光变化导致的色偏。
         V4L2 约定: CAP_PROP_AUTO_EXPOSURE=1 表示手动, =3 表示自动。
-        注意: 并非所有摄像头都支持这些属性, 失败时静默跳过。
+        注意: 并非所有摄像头都支持这些属性, 失败时打印警告。
         """
-        cap.set(cv2.CAP_PROP_AUTO_WB, 0)          # 关闭自动白平衡
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)    # 切换为手动曝光模式
+        ok_wb = cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+        ok_exp = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+        if not ok_wb:
+            print('[WARN] Camera does not support AUTO_WB lock')
+        if not ok_exp:
+            print('[WARN] Camera does not support AUTO_EXPOSURE lock')
 
     # ------------------------------------------------------------------
     # 预处理: CLAHE + 高斯模糊 → HSV

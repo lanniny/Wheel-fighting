@@ -31,6 +31,7 @@ class UartComm:
         self.active = True           # 是否激活发送
         self._last_send = 0.0
         self._send_interval = 0.033  # 最高 30Hz 发送频率
+        self._no_target_interval = 0.2  # 无目标时降到 5Hz, 节省带宽
         self._tx_errors = 0
         self._last_reconnect = 0.0
         self._last_color_send = 0.0
@@ -134,9 +135,10 @@ class UartComm:
         if not self.active:
             return
 
-        # 频率限制
+        # 频率限制: 有目标30Hz, 无目标5Hz
         now = time.time()
-        if now - self._last_send < self._send_interval:
+        interval = self._no_target_interval if target_type == 'X' else self._send_interval
+        if now - self._last_send < interval:
             return
 
         # 串口不可用则尝试重连

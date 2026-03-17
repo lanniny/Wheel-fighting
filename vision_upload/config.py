@@ -46,8 +46,8 @@ HSV_YELLOW = {
 }
 
 HSV_WHITE = {
-    'lower': np.array([0, 0, 200]),
-    'upper': np.array([180, 40, 255]),
+    'lower': np.array([0, 0, 210]),
+    'upper': np.array([180, 30, 255]),
 }
 
 # ============ 检测参数 ============
