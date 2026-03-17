@@ -49,3 +49,21 @@ $RECYCLE.BIN/
 *.tmp
 *.bak
 *.log
+
+# AI 工具配置 (Claude Code / Serena)
+.claude/
+.serena/
+
+# 调试/测试图片
+frame_raw.jpg
+mask_*.jpg
+vision_bench.jpg
+
+# CAD 源文件 (DWG)
+*.DWG
+*.dwg
+
+# 无关文档/压缩包
+*.docx
+*.zip
+发票/
