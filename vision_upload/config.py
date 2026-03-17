@@ -62,6 +62,9 @@ UART_PORT = '/dev/ttyS10'
 UART_BAUD = 115200
 UART_TIMEOUT = 0.01
 
+# ============ 图像预处理 ============
+USE_CLAHE = True     # CLAHE 光照均衡 (对V通道), 赛场灯光不均时推荐开启
+
 # ============ 帧率控制 ============
 TARGET_FPS = 30
 
