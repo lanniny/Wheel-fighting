@@ -37,6 +37,7 @@
 #include "robot_up.h"
 #include "robot_roaming.h"
 #include "robot_backup.h"
+#include "vision_parser.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -126,6 +127,11 @@ int main(void)
   // HAL_Delay(1000);
   //初始化上台模块
    GoUp_Init();
+
+  /* 视觉系统UART接收初始化 */
+  Vision_Init();
+  /* 告知视觉系统己方颜色 (默认蓝方, 实际比赛根据配置修改) */
+  Vision_SendColor('b');
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -147,7 +153,21 @@ int main(void)
     }
     else
     {
-      Roaming_Update();
+      /* 视觉引导模式: 若视觉有效则追踪目标, 否则自主漫游 */
+      if (!Vision_IsTimeout() && vision_target.valid
+          && (vision_target.type == 'E' || vision_target.type == 'N'))
+      {
+        if (vision_target.dir > 20)
+          drive_Right_M();
+        else if (vision_target.dir < -20)
+          drive_Left_M();
+        else
+          drive_For_L();
+      }
+      else
+      {
+        Roaming_Update();
+      }
     }
 
     HAL_Delay(10);
