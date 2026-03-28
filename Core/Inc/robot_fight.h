@@ -26,9 +26,10 @@
 #define FIGHT_IR_TRIGGERED GPIO_PIN_SET
 
 /*======时间参数(ms)======*/
-#define FIGHT_ENGAGE_TIMEOUT 1500 //交战时间
+#define FIGHT_ENGAGE_TIMEOUT 3000 //交战时间
 #define FIGHT_ENGAGE_LOST 500 //交战丢失时间
 #define FIGHT_RETREAT_TIME 400 //撤退时间
+#define FIGHT_TURN_TIME 550 //后退后掉头时间
 
 /*======敌人（能量块）方向======*/
 typedef enum{
@@ -47,6 +48,7 @@ typedef enum{
 typedef enum{
     FIGHT_ENGAGE, //交战
     FIGHT_RETREAT, //后退脱离
+    FIGHT_TURN, //后退后掉头面向敌人
     FIGHT_DONE, //交还控制权回漫游
 }FightState;
 

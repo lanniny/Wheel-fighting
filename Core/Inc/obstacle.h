@@ -15,7 +15,7 @@ typedef struct {
     GPIO_PinState IR8; // 传感器8状态
     GPIO_PinState IR9; // 传感器9状态
     GPIO_PinState IR10; // 传感器10状态
-    
+
     // 如果需要，可以添加组合状态，例如:
     // uint8_t AllStatus; // 8位位掩码，每一位代表一个传感器
 }Obs_Sensors_t;
@@ -26,5 +26,8 @@ extern Obs_Sensors_t Obs_Data;
 // 函数声明
 void Obs_Sensor_Init(void);
 void Obs_Sensor_ReadAll(void);
+void Edge_Sensor_Detect(void);
+void Enmy_Sensor_Detect(void);
+
 
 #endif // OBSTACLE_H

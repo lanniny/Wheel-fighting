@@ -36,4 +36,12 @@ void Vision_SendColor(char color);
  */
 uint8_t Vision_IsTimeout(void);
 
+/**
+ * @brief 获取接收统计 (供调试输出, 参数为NULL则跳过)
+ * @param total   DMA回调触发次数
+ * @param success 成功解析帧数
+ * @param cserr   校验和错误次数
+ */
+void Vision_GetStats(uint32_t *total, uint32_t *success, uint32_t *cserr);
+
 #endif /* __VISION_PARSER_H */

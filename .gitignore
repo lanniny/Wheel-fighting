@@ -67,3 +67,11 @@ vision_bench.jpg
 *.docx
 *.zip
 发票/
+.ace-tool/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# Spec workflow 工具
+.spec-workflow/

@@ -1,10 +1,11 @@
 """
-颜色检测器 v3 - CLAHE光照均衡 + 形态学过滤 + 帧间跟踪平滑
+颜色检测器 v4 - CLAHE光照均衡 + 形态学过滤 + 帧间跟踪平滑
 
-改进点 (vs v2):
-  - detect() 在 HSV V通道上应用 CLAHE, 大幅提升强背光/暗光鲁棒性
-  - set_camera_props() 静态方法: 锁定相机曝光/白平衡, 避免自动调整色偏
-  - 优先级排序: 面积最大(最近)优先, 同时输出距离估计
+改进点 (vs v3):
+  - 白色阈值收紧 S:0-25, 减少反光/高光面误检
+  - 优先级模式可配置: collect(N>E) / attack(E>N)
+  - 距离分段: near/mid/far 替代线性比例, 语义更清晰
+  - Tracker 增加 color_switch_cooldown 防止颜色跳变
 """
 import cv2
 import numpy as np
@@ -13,7 +14,7 @@ import config
 
 class Target:
     __slots__ = ('color', 'cx', 'cy', 'x', 'y', 'w', 'h', 'area',
-                 'solidity', 'distance', 'direction')
+                 'solidity', 'distance', 'distance_level', 'direction')
 
     def __init__(self, color, cx, cy, x, y, w, h, area, solidity=0.0):
         self.color = color
@@ -26,9 +27,17 @@ class Target:
         self.area = area
         self.solidity = solidity
         # 相对画面中心的水平偏移, 归一化到 [-1, +1]
-        # 负值=目标在左半边, 正值=目标在右半边
         self.direction = (cx - config.CAMERA_WIDTH / 2) / (config.CAMERA_WIDTH / 2)
-        # 基于面积的粗略距离估计 [0, 1], 越大越近
+        # 距离分段: 'near'/'mid'/'far'
+        near_th = getattr(config, 'DISTANCE_NEAR', 12000)
+        far_th = getattr(config, 'DISTANCE_FAR', 3000)
+        if area >= near_th:
+            self.distance_level = 'near'
+        elif area <= far_th:
+            self.distance_level = 'far'
+        else:
+            self.distance_level = 'mid'
+        # 连续距离值保留兼容
         self.distance = min(1.0, area / config.MAX_CONTOUR_AREA)
 
     def __repr__(self):
@@ -203,14 +212,23 @@ class ColorDetector:
 
     def get_priority_target(self, friends, enemies, neutrals):
         """
-        获取最优先攻击目标 (面积最大=最近优先)
-        优先级: 敌方 > 中立 > None
+        获取最优先目标 (面积最大=最近优先)
+        优先级由 config.PRIORITY_MODE 决定:
+          - 'collect': N(中立) > E(敌方) — 收集能量块得分为主
+          - 'attack':  E(敌方) > N(中立) — 推敌方能量块为主
         返回: (type_char, target) 或 ('X', None)
         """
-        if enemies:
-            return 'E', enemies[0]
-        if neutrals:
-            return 'N', neutrals[0]
+        mode = getattr(config, 'PRIORITY_MODE', 'collect')
+        if mode == 'collect':
+            if neutrals:
+                return 'N', neutrals[0]
+            if enemies:
+                return 'E', enemies[0]
+        else:
+            if enemies:
+                return 'E', enemies[0]
+            if neutrals:
+                return 'N', neutrals[0]
         return 'X', None
 
     def draw_targets(self, frame, targets, my_color='b'):

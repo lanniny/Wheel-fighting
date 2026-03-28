@@ -1,6 +1,5 @@
 #include "motor.h"
 #include "robot_up.h"
-#include "robot_backup.h"
 #include "usart.h"
 
 static GoUpState GoUp_Stage = GOUP_RUSH;
@@ -56,7 +55,7 @@ TeamColor Startup_WaitForTrigger(void)
         else
         {
             right_hold = 0;
-        }       
+        }
     }
 
     /*通知鲁班猫*/
@@ -71,7 +70,7 @@ TeamColor Startup_WaitForTrigger(void)
  */
 void Startup_Notify(TeamColor team)
 {
-    uint8_t msg = (team == TEAM_YELLOW) ? 'Y' : 'B';
+    uint8_t msg = (team == TEAM_YELLOW) ? 'y' : 'b';
     HAL_UART_Transmit(&huart2, &msg, 1, 100);
 }
 
@@ -85,7 +84,6 @@ void GoUp_Init(void)
     GoUp_Stage = GOUP_RUSH;
     GoUp_StartTime = HAL_GetTick();
     GoUp_Done = false;
-    Backup_State = GOUP_START;
 }
 
 /**
@@ -120,7 +118,7 @@ void GoUp_Update()
             break;
 
         case GOUP_DONE:
-            Backup_State = GOUP_ON;
+            MOTOR_StopAll();
             GoUp_Done = true;
             break;
 

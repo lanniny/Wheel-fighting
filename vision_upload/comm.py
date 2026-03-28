@@ -35,6 +35,11 @@ class UartComm:
         self._tx_errors = 0
         self._last_reconnect = 0.0
         self._last_color_send = 0.0
+        # 发送统计
+        self._tx_total = 0
+        self._tx_success = 0
+        self._stats_timer = 0.0
+        self._STATS_INTERVAL = 60.0  # 每60秒打印统计
 
     # ------------------------------------------------------------------
     # 开关
@@ -146,6 +151,7 @@ class UartComm:
             self._try_reconnect()
             return
 
+        self._tx_total += 1
         try:
             dir_int = max(-100, min(100, int(direction * 100)))
             if target_type == 'X':
@@ -156,50 +162,67 @@ class UartComm:
             msg = f'${body}*{cs}\n'
             self.ser.write(msg.encode())
             self._last_send = now
-            self._tx_errors = 0          # 成功则清零错误计数
+            self._tx_errors = 0
+            self._tx_success += 1
         except Exception as e:
             self._tx_errors += 1
             if self._tx_errors >= self._TX_ERROR_THRESHOLD:
                 print(f'[UART] TX error #{self._tx_errors}: {e}, reconnecting')
                 self._try_reconnect()
 
+        # 定期打印发送统计
+        if now - self._stats_timer >= self._STATS_INTERVAL:
+            rate = (self._tx_success / self._tx_total * 100
+                    if self._tx_total > 0 else 0)
+            print(f'[UART] Stats: {self._tx_success}/{self._tx_total} '
+                  f'({rate:.1f}%) in {self._STATS_INTERVAL:.0f}s')
+            self._tx_total = 0
+            self._tx_success = 0
+            self._stats_timer = now
+
     # ------------------------------------------------------------------
-    # 颜色心跳
+    # 颜色心跳 (已废弃)
     # ------------------------------------------------------------------
     def send_color_heartbeat(self):
         """
-        定期向 STM32 重发己方颜色字符。
-        防止 STM32 上电序列中未接收到初始颜色指令。
+        [已废弃] 原设计定期向 STM32 重发己方颜色字符。
+        但实际协议中颜色由 STM32 通过 Vision_SendColor() 下发给上位机，
+        STM32 的 vision_parser 仅解析 $...*CS 格式帧，单字节颜色会被忽略。
+        保留方法签名以兼容调用方，但不再执行任何操作。
         """
-        if not self.ser:
-            return
-        now = time.time()
-        if now - self._last_color_send < self._COLOR_HEARTBEAT_INTERVAL:
-            return
-        self._last_color_send = now
-        try:
-            self.ser.write(self.my_color.encode())
-        except Exception:
-            pass
+        pass
 
     # ------------------------------------------------------------------
     # 高层接口
     # ------------------------------------------------------------------
     def send_from_detection(self, friends, enemies, neutrals, bombs=None):
         """
-        根据优先级发送最重要目标:
-          炸弹(B) > 敌方(E) > 中立(N) > 无目标(X)
+        根据优先级发送最重要目标, 尊重 config.PRIORITY_MODE:
+          炸弹(B) 始终最优先
+          collect 模式: N(中立) > E(敌方)
+          attack  模式: E(敌方) > N(中立)
+          无目标 → X
 
         bombs: 炸弹目标列表 (可选, 当前为保留接口)
         """
         if bombs:
             t = bombs[0]
             self.send_target('B', t.cx, t.cy, t.area, t.direction)
-        elif enemies:
-            t = enemies[0]
-            self.send_target('E', t.cx, t.cy, t.area, t.direction)
-        elif neutrals:
-            t = neutrals[0]
-            self.send_target('N', t.cx, t.cy, t.area, t.direction)
+            return
+
+        mode = getattr(config, 'PRIORITY_MODE', 'collect')
+        if mode == 'collect':
+            first, first_type = neutrals, 'N'
+            second, second_type = enemies, 'E'
+        else:
+            first, first_type = enemies, 'E'
+            second, second_type = neutrals, 'N'
+
+        if first:
+            t = first[0]
+            self.send_target(first_type, t.cx, t.cy, t.area, t.direction)
+        elif second:
+            t = second[0]
+            self.send_target(second_type, t.cx, t.cy, t.area, t.direction)
         else:
             self.send_target('X')

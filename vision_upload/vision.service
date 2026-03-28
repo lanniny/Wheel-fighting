@@ -1,0 +1,17 @@
+[Unit]
+Description=Robot Vision System v4
+After=network.target
+
+[Service]
+Type=simple
+User=radxa
+WorkingDirectory=/home/radxa/vision_upload
+ExecStart=/usr/bin/python3 main.py --priority-mode collect
+Restart=always
+RestartSec=3
+Environment=VISION_UART=/dev/ttyAS1
+Environment=VISION_CLAHE=1
+Environment=VISION_FPS=30
+
+[Install]
+WantedBy=multi-user.target

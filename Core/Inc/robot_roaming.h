@@ -26,9 +26,11 @@ typedef enum {
 #define ROAMING_BACKAND_TURN_TIME  500   // 后退并转向时间
 #define ROAMING_TURN_TIME  300   // 转向时间
 #define ROAMING_FORWARD_TIME 300 // 前进时间
+#define ROAMING_EDGE_DEBOUNCE_MS  20  // 边缘检测消抖窗口(ms)
 
 void Roaming_Init(void);
 void Roaming_Update(void);
 bool Roaming_IsDone(void);
+bool Roaming_IsForward(void);
 
 #endif // ROBOT_ROAMING_H

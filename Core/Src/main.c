@@ -37,6 +37,7 @@
 #include "robot_up.h"
 #include "robot_roaming.h"
 #include "robot_backup.h"
+#include "robot_control.h"
 #include "vision_parser.h"
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -119,19 +120,10 @@ int main(void)
   Obs_Sensor_Init();
   MOTOR_Init();
   Backup_Init();
-  OLED_Init();
-  OLED_Clear();
-
-  //初始化电机PWM
-  // MOTOR_Init();
-  // HAL_Delay(1000);
-  //初始化上台模块
-   GoUp_Init();
-
-  /* 视觉系统UART接收初始化 */
+  MOTOR_StopAll();
+  Startup_WaitForTrigger();
   Vision_Init();
-  /* 告知视觉系统己方颜色 (默认蓝方, 实际比赛根据配置修改) */
-  Vision_SendColor('b');
+  Robot_Control_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -139,37 +131,7 @@ int main(void)
 
   while (1)
   {
-    if(Backup_State == GOUP_START)
-    {
-      GoUp_Update();
-      if(Backup_State == GOUP_ON)
-      {
-        Roaming_Init();
-      }
-    }
-    else if(Backup_State == GOUP_FALL)
-    {
-      Backup_Update();
-    }
-    else
-    {
-      /* 视觉引导模式: 若视觉有效则追踪目标, 否则自主漫游 */
-      if (!Vision_IsTimeout() && vision_target.valid
-          && (vision_target.type == 'E' || vision_target.type == 'N'))
-      {
-        if (vision_target.dir > 20)
-          drive_Right_M();
-        else if (vision_target.dir < -20)
-          drive_Left_M();
-        else
-          drive_For_L();
-      }
-      else
-      {
-        Roaming_Update();
-      }
-    }
-
+    Robot_Control_Update();
     HAL_Delay(10);
     /* USER CODE END WHILE */
 

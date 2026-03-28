@@ -24,6 +24,11 @@
 /* ---- 全局目标数据 ---- */
 volatile VisionTarget_t vision_target = { .type = 'X', .valid = 0u };
 
+/* ---- 接收统计 ---- */
+static uint32_t vision_rx_total   = 0u;  /* DMA回调触发次数 */
+static uint32_t vision_rx_success = 0u;  /* 成功解析帧数 */
+static uint32_t vision_rx_cserr   = 0u;  /* 校验和错误次数 */
+
 /* ---- 内部缓冲区 ---- */
 static uint8_t dma_rx_buf[DMA_RX_BUF_SIZE];
 
@@ -80,7 +85,10 @@ static void parse_frame(const uint8_t *buf, uint16_t size)
     char cs_str[3] = { star[1], star[2], '\0' };
     uint8_t received_cs = (uint8_t)strtol(cs_str, NULL, 16);
 
-    if (expected_cs != received_cs) return;  /* 校验失败, 丢弃 */
+    if (expected_cs != received_cs) {
+        vision_rx_cserr++;
+        return;  /* 校验失败, 丢弃 */
+    }
 
     /* 解析字段: type,cx,cy,area,dir */
     char body_copy[48];
@@ -93,14 +101,17 @@ static void parse_frame(const uint8_t *buf, uint16_t size)
                     &type_ch, &cx, &cy, &area, &dir);
     if (n != 5) return;
 
-    /* 写入全局变量 (在中断上下文中, 操作原子性由单字节写入保证) */
+    /* 写入全局变量: 先置 valid=0 屏蔽旧数据, 写完字段后再置 valid
+     * 防止主循环读到 "旧cx + 新area" 的不一致状态 */
+    vision_target.valid     = 0u;
     vision_target.type      = type_ch;
     vision_target.cx        = (int16_t)cx;
     vision_target.cy        = (int16_t)cy;
     vision_target.area      = (int32_t)area;
     vision_target.dir       = (int8_t)((dir < -100) ? -100 : ((dir > 100) ? 100 : dir));
-    vision_target.valid     = (type_ch != 'X') ? 1u : 0u;
     vision_target.timestamp = HAL_GetTick();
+    vision_target.valid     = (type_ch != 'X') ? 1u : 0u;
+    vision_rx_success++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -109,6 +120,8 @@ static void parse_frame(const uint8_t *buf, uint16_t size)
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance != USART2) return;
+
+    vision_rx_total++;
 
     /* 解析本次接收到的数据 */
     if (Size > 0u) {
@@ -158,4 +171,14 @@ uint8_t Vision_IsTimeout(void)
 {
     if (vision_target.timestamp == 0u) return 1u;
     return ((HAL_GetTick() - vision_target.timestamp) > VISION_TIMEOUT_MS) ? 1u : 0u;
+}
+
+/**
+ * @brief 获取接收统计 (供调试输出)
+ */
+void Vision_GetStats(uint32_t *total, uint32_t *success, uint32_t *cserr)
+{
+    if (total)   *total   = vision_rx_total;
+    if (success) *success = vision_rx_success;
+    if (cserr)   *cserr   = vision_rx_cserr;
 }

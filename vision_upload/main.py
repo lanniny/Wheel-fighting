@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-轮式格斗机器人 - 视觉主程序 v3
+轮式格斗机器人 - 视觉主程序 v4
 
-改进 (vs v2):
-  - 严格 30fps 帧率控制, 避免 CPU 空转或跑飞
-  - UART 颜色心跳: 每5秒重发己方颜色, 防 STM32 丢失
-  - 相机曝光/白平衡锁定: 减少赛场灯光干扰
-  - 调试帧异步写入: 不阻塞主检测循环
+改进 (vs v3):
+  - Watchdog: 连续30s无有效帧自动重启相机
+  - 优先级模式: --priority-mode collect(N>E) / attack(E>N)
+  - 白色阈值收紧: 减少反光误检
+  - 距离分段: near/mid/far 替代线性比例
+  - 环境变量覆盖: VISION_UART, VISION_CLAHE, VISION_FPS 等
+  - UART 发送统计: 每60s打印成功率
 
 用法:
-    python3 main.py              # 正常运行 (连STM32)
-    python3 main.py --debug      # 调试模式 (保存标注帧)
-    python3 main.py --calibrate  # 标定模式 (打印HSV值)
-    python3 main.py --no-uart    # 不连串口 (本地测试)
-    python3 main.py --color y    # 指定己方颜色为黄色
+    python3 main.py                       # 正常运行 (连STM32)
+    python3 main.py --debug               # 调试模式 (保存标注帧)
+    python3 main.py --calibrate           # 标定模式 (打印HSV值)
+    python3 main.py --no-uart             # 不连串口 (本地测试)
+    python3 main.py --color y             # 指定己方颜色为黄色
+    python3 main.py --priority-mode collect  # 收集模式 (白色优先)
 """
 import sys
 import time
@@ -94,6 +97,9 @@ class VisionSystem:
         self._fps = 0.0
         self._tx_count = 0
         self._debug_thread = None
+        # Watchdog: 连续无有效帧则重启相机
+        self._last_valid_frame = time.time()
+        self._watchdog_timeout = getattr(config, 'WATCHDOG_TIMEOUT', 30.0)
 
     def _update_fps(self):
         self._frame_count += 1
@@ -137,6 +143,8 @@ class VisionSystem:
         print(f'Color : {self.comm.my_color}')
         print(f'UART  : {"on" if self.use_uart else "off"}')
         print(f'CLAHE : {"on" if getattr(config, "USE_CLAHE", True) else "off"}')
+        print(f'Priority: {getattr(config, "PRIORITY_MODE", "collect")}')
+        print(f'Watchdog: {self._watchdog_timeout:.0f}s')
         print('-' * 55)
 
         frame_idx = 0
@@ -150,18 +158,25 @@ class VisionSystem:
                 # 1. 读帧
                 frame = self.camera.read()
                 if frame is None:
+                    # Watchdog: 连续无帧超时则重启相机
+                    if time.time() - self._last_valid_frame > self._watchdog_timeout:
+                        print(f'\n[WATCHDOG] No valid frame for '
+                              f'{self._watchdog_timeout:.0f}s, restarting camera...')
+                        self.camera.release()
+                        self.camera.open()
+                        self._last_valid_frame = time.time()
                     time.sleep(0.05)
                     next_frame = time.perf_counter() + frame_dt
                     continue
+                self._last_valid_frame = time.time()
 
                 # 2. 读STM32指令
                 cmd = self.comm.read_command()
                 if cmd:
                     print(f'\n[UART] Cmd: {cmd!r} my_color={self.comm.my_color}')
 
-                # 3. 颜色心跳
-                if self.use_uart:
-                    self.comm.send_color_heartbeat()
+                # 3. 颜色由 STM32 下发 (Vision_SendColor)，上位机通过
+                #    read_command() 被动接收，无需主动发送心跳
 
                 # 4. 标定模式
                 if self.calibrate:
@@ -231,12 +246,19 @@ class VisionSystem:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Robot Vision System v3')
+    parser = argparse.ArgumentParser(description='Robot Vision System v4')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--calibrate', action='store_true')
     parser.add_argument('--no-uart', action='store_true')
     parser.add_argument('--color', choices=['b', 'y'], default='b')
+    parser.add_argument('--priority-mode', choices=['collect', 'attack'],
+                        default=None,
+                        help='Target priority: collect(N>E) or attack(E>N)')
     args = parser.parse_args()
+
+    # 命令行参数覆盖配置
+    if args.priority_mode:
+        config.PRIORITY_MODE = args.priority_mode
 
     vision = VisionSystem(
         debug=args.debug,

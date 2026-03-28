@@ -1,0 +1,17 @@
+[Unit]
+Description=Robot Combat Vision Pipeline
+After=network.target
+
+[Service]
+Type=simple
+User=radxa
+Environment=LD_LIBRARY_PATH=/home/radxa/ai-sdk/viplite-tina/lib/aarch64-none-linux-gnu/v2.0/
+WorkingDirectory=/home/radxa/RobotCombatAI/scripts/inference
+ExecStart=/usr/bin/python3 /home/radxa/RobotCombatAI/scripts/inference/realtime_vision.py --backend viplite --model /home/radxa/ai-sdk/examples/yolov5/etc/npu/yolov5/model/yolov5.nb --serial-port /dev/ttyS0
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
