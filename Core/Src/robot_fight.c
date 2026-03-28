@@ -6,9 +6,12 @@
 #include "vision_parser.h"
 #include "usart.h"
 
+extern float voltage[2];
+
 static FightState Fight_State = FIGHT_ENGAGE;
 static uint32_t Fight_StartTime = 0;
 static bool Fight_DoneFlag = false;
+static bool Fight_DownFlag = false;
 static uint32_t Fight_EngageLost = 0;     // ENGAGE中丢失目标的起始时间
 
 /* 方向消抖: 连续2次相同方向才确认有效 */
@@ -86,6 +89,15 @@ static bool Fight_EdgeDetected(void)
     return (Obs_Data.IR1 == SET || Obs_Data.IR2 == SET);
 }
 
+/**
+ * @description: 掉台检测(灰度传感器电压阈值)
+ */
+static bool Fight_DetectShade(void)
+{
+    site_detect_shade();
+    return (voltage[0] > 2.7f && voltage[1] > 2.7f);
+}
+
 /*======状态机======*/
 
 void Fight_Init(void)
@@ -98,12 +110,21 @@ void Fight_Init(void)
     Fight_StableDir  = DIR_NONE;
     Fight_EdgeCount = 0;
     prev_vision_dir = 0;
+    Fight_DownFlag = false;
 }
 
 void Fight_Update(void)
 {
     uint32_t now = HAL_GetTick();
     uint32_t elapsed = now - Fight_StartTime;
+
+    /*======掉台安全: 灰度传感器检测======*/
+    if(Fight_DetectShade())
+    {
+        Fight_DownFlag = true;
+        MOTOR_StopAll();
+        return;
+    }
 
     /* 方向消抖: 内联逻辑 */
     EnemyDir raw_dir = Fight_GetEnemyDir();
@@ -149,19 +170,21 @@ void Fight_Update(void)
                 uint8_t vision_ok = (!Vision_IsTimeout() && vision_target.valid);
 
                 /*己方能量块->回避*/
-                if (vision_ok && (vision_target.type == 'F' || vision_target.type == 'B')) {
+                if (vision_ok && vision_target.type == 'F') {
                     MOTOR_StopAll();
                     Fight_State    = FIGHT_DONE;
                     Fight_DoneFlag = true;
                     break;
                 }
 
-                /*白色能量块 -> 视觉精准追踪(PD+距离自适应)*/
-                if(vision_ok && vision_target.type == 'N')
+                /*视觉检测到敌方->PD追踪*/
+                if(vision_ok && vision_target.type == 'E')
                 {
                     Fight_VisionChase();
                     break;
                 }
+
+                /*视觉无目标但光电有目标 = 白色块或敌方车, 直接冲*/
 
                 switch(dir)
                 {
@@ -248,4 +271,9 @@ void Fight_Update(void)
 bool Fight_IsDone(void)
 {
     return Fight_DoneFlag;
+}
+
+bool Fight_IsDown(void)
+{
+    return Fight_DownFlag;
 }

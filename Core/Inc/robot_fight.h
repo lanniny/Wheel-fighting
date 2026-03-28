@@ -56,6 +56,7 @@ typedef enum{
 void     Fight_Init(void);
 void     Fight_Update(void);
 bool     Fight_IsDone(void);
+bool     Fight_IsDown(void);            // 格斗中掉台检测
 EnemyDir Fight_GetEnemyDir(void);       // 获取敌人方向
 
 #endif // ROBOT_FIGHT_H
