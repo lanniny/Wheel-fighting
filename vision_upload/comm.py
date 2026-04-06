@@ -33,8 +33,9 @@ class UartComm:
         self.active = True           # 是否激活发送
         self._color_changed = False  # 颜色切换标志, 供主循环检测并切换WB
         self._last_send = 0.0
-        self._send_interval = 0.050  # 最高 20Hz 发送频率 (30Hz→20Hz, 降低UART压力)
+        self._send_interval = 0.050  # 最高 20Hz 发送频率
         self._no_target_interval = 0.2  # 无目标时降到 5Hz, 节省带宽
+        self._fast_interval = 0.033  # 快速运动时 30Hz
         self._tx_errors = 0
         self._last_reconnect = 0.0
         self._last_color_send = 0.0
@@ -42,23 +43,39 @@ class UartComm:
         self._tx_total = 0
         self._tx_success = 0
         self._stats_timer = 0.0
-        self._STATS_INTERVAL = 60.0  # 每60秒打印统计
+        self._STATS_INTERVAL = 60.0
+        # 方向平滑: 滑动窗口
+        self._dir_window = []
+        self._dir_smooth_size = getattr(
+            __import__('config'), 'DIRECTION_SMOOTH_WINDOW', 3)
 
     # ------------------------------------------------------------------
     # 开关
     # ------------------------------------------------------------------
     def open(self):
-        """打开串口, 失败时静默返回 False"""
+        """打开串口, 启用 low_latency 模式, 失败时静默返回 False"""
         try:
             import serial
+            # 重新探测设备 (USB设备号可能变化)
+            port = config._find_uart()
             self.ser = serial.Serial(
-                port=config.UART_PORT,
+                port=port,
                 baudrate=config.UART_BAUD,
                 timeout=config.UART_TIMEOUT,
                 write_timeout=0.05,
             )
+            # 启用 low_latency 模式 (减少内核缓冲延迟)
+            try:
+                import subprocess
+                subprocess.run(['stty', '-F', port, 'low_latency'],
+                               capture_output=True, timeout=2)
+            except Exception:
+                pass
+            # 清空残留数据
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
             self._tx_errors = 0
-            print(f'UART opened: {config.UART_PORT} @ {config.UART_BAUD}')
+            print(f'UART opened: {port} @ {config.UART_BAUD} (low_latency)')
             return True
         except Exception as e:
             print(f'UART open failed: {e}')
@@ -77,12 +94,12 @@ class UartComm:
     # 内部: 重连
     # ------------------------------------------------------------------
     def _try_reconnect(self):
-        """限速重连: 冷却期内不重复尝试"""
+        """限速重连: 冷却期内不重复尝试, 重连时重新探测设备号"""
         now = time.time()
         if now - self._last_reconnect < self._RECONNECT_INTERVAL:
             return
         self._last_reconnect = now
-        print('[UART] Reconnecting...')
+        print('[UART] Reconnecting (re-detecting device)...')
         self.close()
         if self.open():
             print('[UART] Reconnected OK')
@@ -141,20 +158,30 @@ class UartComm:
     # ------------------------------------------------------------------
     def send_target(self, target_type: str, cx=0, cy=0, area=0, direction=0.0):
         """
-        发送一帧目标数据给 STM32, 含频率限制和自动重连。
-
-        参数:
-            target_type : 'E' / 'N' / 'F' / 'X' / 'B'
-            cx, cy      : 目标中心像素坐标
-            area        : 目标面积 (像素)
-            direction   : 归一化方向 [-1.0, +1.0], 内部转换为 [-100,+100] 整数
+        发送一帧目标数据给 STM32, 含频率限制、方向平滑和自动重连。
         """
         if not self.active:
             return
 
-        # 频率限制: 有目标30Hz, 无目标5Hz
+        # 方向平滑: 滑动窗口平均
+        if target_type != 'X':
+            self._dir_window.append(direction)
+            if len(self._dir_window) > self._dir_smooth_size:
+                self._dir_window = self._dir_window[-self._dir_smooth_size:]
+            direction = sum(self._dir_window) / len(self._dir_window)
+        else:
+            self._dir_window.clear()
+
+        # 自适应发送频率: 目标运动快→30Hz, 慢→20Hz, 无目标→5Hz
         now = time.time()
-        interval = self._no_target_interval if target_type == 'X' else self._send_interval
+        if target_type == 'X':
+            interval = self._no_target_interval
+        elif len(self._dir_window) >= 2:
+            dir_delta = abs(self._dir_window[-1] - self._dir_window[-2])
+            interval = self._fast_interval if dir_delta > 0.05 else self._send_interval
+        else:
+            interval = self._send_interval
+
         if now - self._last_send < interval:
             return
 

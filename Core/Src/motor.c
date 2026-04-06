@@ -106,6 +106,14 @@ void drive_For_H(void)
     MOTOR_SetSpeed(MOTOR_4, SPEED_HIGH);
 }
 
+void drive_For_Roaming(void)
+{
+    MOTOR_SetSpeed(MOTOR_1, SPEED_ROAMING);
+    MOTOR_SetSpeed(MOTOR_2, SPEED_ROAMING);
+    MOTOR_SetSpeed(MOTOR_3, SPEED_ROAMING);
+    MOTOR_SetSpeed(MOTOR_4, SPEED_ROAMING);
+}
+
 void drive_Back_L(void)//后退(低中高)
 {
     MOTOR_SetSpeed(MOTOR_1, -SPEED_LOW);
@@ -130,7 +138,7 @@ void drive_Back_H(void)
     MOTOR_SetSpeed(MOTOR_4, -SPEED_HIGH);
 }
 
-void drive_Left_M(void)//微左右转
+void drive_Left_M(void)//中左转
 {
    MOTOR_SetSpeed(MOTOR_1, -SPEED_TURN_M);
    MOTOR_SetSpeed(MOTOR_2, -SPEED_TURN_M);
@@ -138,12 +146,28 @@ void drive_Left_M(void)//微左右转
    MOTOR_SetSpeed(MOTOR_4, SPEED_TURN_M);
 }
 
-void drive_Right_M(void)
+void drive_Right_M(void)//中右转
 {
     MOTOR_SetSpeed(MOTOR_1, SPEED_TURN_M);
     MOTOR_SetSpeed(MOTOR_2, SPEED_TURN_M);
     MOTOR_SetSpeed(MOTOR_3, -SPEED_TURN_M);
     MOTOR_SetSpeed(MOTOR_4, -SPEED_TURN_M);
+}
+
+void drive_Left_L(void)//慢左转
+{
+   MOTOR_SetSpeed(MOTOR_1, -SPEED_TURN_L);
+   MOTOR_SetSpeed(MOTOR_2, -SPEED_TURN_L);
+   MOTOR_SetSpeed(MOTOR_3, SPEED_TURN_L);
+   MOTOR_SetSpeed(MOTOR_4, SPEED_TURN_L);
+}
+
+void drive_Right_L(void)//慢右转
+{
+    MOTOR_SetSpeed(MOTOR_1, SPEED_TURN_L);
+    MOTOR_SetSpeed(MOTOR_2, SPEED_TURN_L);
+    MOTOR_SetSpeed(MOTOR_3, -SPEED_TURN_L);
+    MOTOR_SetSpeed(MOTOR_4, -SPEED_TURN_L);
 }
 
 void drive_Left_S(void)//超级左右转
@@ -200,4 +224,20 @@ void drive_ArcRight_M(void)
     MOTOR_SetSpeed(MOTOR_2, SPEED_ARC_OUTER_M);
     MOTOR_SetSpeed(MOTOR_3, SPEED_ARC_INNER_M);
     MOTOR_SetSpeed(MOTOR_4, SPEED_ARC_INNER_M);
+}
+
+void drive_Left_Roaming(void)
+{
+    MOTOR_SetSpeed(MOTOR_1, -SPEED_TURN_R);
+    MOTOR_SetSpeed(MOTOR_2, -SPEED_TURN_R);
+    MOTOR_SetSpeed(MOTOR_3, SPEED_TURN_R);
+    MOTOR_SetSpeed(MOTOR_4, SPEED_TURN_R);
+}
+
+void drive_Right_Roaming(void)
+{
+    MOTOR_SetSpeed(MOTOR_1, SPEED_TURN_R);
+    MOTOR_SetSpeed(MOTOR_2, SPEED_TURN_R);
+    MOTOR_SetSpeed(MOTOR_3, -SPEED_TURN_R);
+    MOTOR_SetSpeed(MOTOR_4, -SPEED_TURN_R);
 }

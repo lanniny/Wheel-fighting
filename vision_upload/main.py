@@ -187,7 +187,15 @@ class VisionSystem:
         self.stream = stream
         self.camera = Camera()
         self.detector = ColorDetector(enable_tracking=True)
-        self.tag_detector = TagDetector(tag_backend) if tag_backend else None
+        # Tag 检测: 显式指定后端 或 config 启用时自动创建
+        if tag_backend:
+            self.tag_detector = TagDetector(tag_backend)
+        elif getattr(config, 'TAG_DETECT_ENABLED', False):
+            self.tag_detector = TagDetector()
+        else:
+            self.tag_detector = None
+        self._tag_interval = getattr(config, 'TAG_DETECT_INTERVAL', 3)
+        self._last_tags = []  # 缓存最近一次 Tag 检测结果
         self.comm = UartComm()
         self._frame_count = 0
         self._fps_timer = time.time()
@@ -330,39 +338,78 @@ class VisionSystem:
                 targets = []
                 friends, enemies, neutrals = [], [], []
                 pt = None
+                tag_type_override = None  # Tag 覆盖颜色分类
+
                 collect_mode = (
                     self.tag_detector is not None
                     and getattr(self.comm, 'mode', 'fight') == 'collect'
                 )
 
                 if collect_mode:
-                    # 收集模式: 仅 Tag 检测, 不做颜色检测
+                    # 收集模式: 仅 Tag 检测
                     n_own = 0 if own_only else -1
                     if frame_idx % 5 == 0:
                         tags = self.tag_detector.detect_tags(frame)
                         tags.sort(key=lambda t: int(t.get('area', 0)),
                                   reverse=True)
-                elif own_only:
-                    own_targets = self.detector.detect_own(
-                        frame, self.comm.my_color)
-                    n_own = len(own_targets)
-                    pt = own_targets[0] if own_targets else None
+                        self._last_tags = tags
+                    else:
+                        tags = self._last_tags
                 else:
-                    targets = self.detector.detect(frame)
-                    friends, enemies, neutrals = self.detector.classify(
-                        targets, self.comm.my_color)
-                    n_own = -1
-                    _, pt = self.detector.get_priority_target(
-                        friends, enemies, neutrals)
+                    # 格斗模式: 颜色检测(每帧) + Tag 辅助(降频)
+                    if own_only:
+                        own_targets = self.detector.detect_own(
+                            frame, self.comm.my_color)
+                        n_own = len(own_targets)
+                        pt = own_targets[0] if own_targets else None
+                    else:
+                        targets = self.detector.detect(frame)
+                        friends, enemies, neutrals = self.detector.classify(
+                            targets, self.comm.my_color)
+                        n_own = -1
+                        _, pt = self.detector.get_priority_target(
+                            friends, enemies, neutrals)
+
+                    # Tag 辅助检测: 每 N 帧做一次, 用 Tag ID 覆盖颜色分类
+                    if (self.tag_detector is not None
+                            and frame_idx % self._tag_interval == 0):
+                        tags = self.tag_detector.detect_tags(frame)
+                        self._last_tags = tags
+                    else:
+                        tags = self._last_tags
+
+                    # Tag→类型覆盖: 匹配最近的颜色目标
+                    if tags and pt:
+                        from detector import TagDetector as _TD
+                        best_tag = tags[0]
+                        tag_cx = best_tag.get('cx', 0)
+                        tag_cy = best_tag.get('cy', 0)
+                        dist = ((tag_cx - pt.cx)**2 + (tag_cy - pt.cy)**2)**0.5
+                        if dist < 80:
+                            tag_type_override = _TD.classify_tag(
+                                best_tag.get('id', 0), self.comm.my_color)
 
                 t_det = time.perf_counter()
 
                 # 5. 发送 [计时: uart]
                 if collect_mode:
                     if tags:
-                        self.comm.send_tag(tags[0])
+                        # 收集模式: Tag 结果转为类型发送
+                        from detector import TagDetector as _TD
+                        best = tags[0]
+                        t_type = _TD.classify_tag(
+                            best.get('id', 0), self.comm.my_color)
+                        direction = ((best.get('cx', 0) - config.CAMERA_WIDTH / 2)
+                                     / (config.CAMERA_WIDTH / 2))
+                        self.comm.send_target(t_type, best.get('cx', 0),
+                                              best.get('cy', 0),
+                                              best.get('area', 0), direction)
                     else:
                         self.comm.send_target('X')
+                elif tag_type_override and pt:
+                    # Tag 覆盖: 用精确类型发送
+                    self.comm.send_target(tag_type_override,
+                                          pt.cx, pt.cy, pt.area, pt.direction)
                 elif own_only:
                     self.comm.send_own_detection(own_targets)
                 else:

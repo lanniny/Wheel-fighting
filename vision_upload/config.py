@@ -39,11 +39,12 @@ CAMERA_FOURCC = os.environ.get('VISION_FOURCC', 'MJPG')  # MJPG=硬解, YUYV=软
 
 # ============ 白平衡 ============
 AUTO_WB = int(os.environ.get('VISION_AUTO_WB', '0'))       # 0=固定WB, 1=自动WB
-# WB 按队伍颜色动态设置: 蓝队4200K, 黄队6000K (Realtek相机色彩特性)
-# 可通过环境变量覆盖
-WB_TEMPERATURE = int(os.environ.get('VISION_WB_TEMP', '0'))  # 0=自动按颜色选择
-WB_BLUE = 4200   # 蓝队最佳色温
-WB_YELLOW = 6000  # 黄队最佳色温
+# 统一使用 4200K 冷色温 (蓝/黄队通用)
+# 原因: WB>4600K 会导致蓝色能量块 H 偏移到黄色范围, 造成严重误检
+# 实测: WB=4200K 蓝色检出8.2% 黄色误检2.2%(被排斥掩码消除)
+WB_TEMPERATURE = int(os.environ.get('VISION_WB_TEMP', '4200'))
+WB_BLUE = 4200   # 蓝队色温 (保留兼容)
+WB_YELLOW = 4200  # 黄队色温 (原6000K→4200K, 修复蓝色误检为黄色)
 
 
 def setup_camera(cap):
@@ -95,17 +96,17 @@ def setup_camera(cap):
 
 # ============ HSV 颜色阈值 ============
 HSV_BLUE = {
-    'lower': np.array([100, 50, 40]),
+    'lower': np.array([100, 60, 40]),
     'upper': np.array([130, 255, 255]),
 }
 
 HSV_YELLOW = {
-    'lower': np.array([20, 40, 40]),
+    'lower': np.array([22, 80, 40]),
     'upper': np.array([42, 255, 255]),
 }
 # 黄色二阶段验证: 轮廓内 S 均值必须 > 此值, 否则判为蓝色冒充
-# (Realtek相机在WB=6000K下: 黄色S≈134, 蓝色S≈97, 阈值115分离)
-YELLOW_S_MEAN_MIN = int(os.environ.get('VISION_YELLOW_S_MEAN', '115'))
+# (Realtek相机在WB=6000K下: 黄色S≈134, 蓝色S≈97, 阈值120分离)
+YELLOW_S_MEAN_MIN = int(os.environ.get('VISION_YELLOW_S_MEAN', '120'))
 
 HSV_WHITE = {
     'lower': np.array([0, 0, 230]),
@@ -122,9 +123,32 @@ MAX_ASPECT_RATIO = 3.0
 MAX_TARGETS = 10
 
 # ============ 串口通信 (支持环境变量覆盖) ============
-UART_PORT = os.environ.get('VISION_UART', '/dev/ttyAS1')
+def _find_uart():
+    """自动探测 UART 设备: 环境变量 > USB转TTL自动探测 > GPIO UART 回退"""
+    env_uart = os.environ.get('VISION_UART')
+    if env_uart:
+        # 环境变量指定了具体设备, 但如果不存在则尝试探测
+        if os.path.exists(env_uart):
+            return env_uart
+        print(f'[UART] {env_uart} not found, auto-detecting...')
+
+    # 自动探测 USB转TTL (ttyUSB*)
+    import glob
+    usb_devs = sorted(glob.glob('/dev/ttyUSB*'))
+    if usb_devs:
+        print(f'[UART] Auto-detected: {usb_devs[0]}')
+        return usb_devs[0]
+
+    # 回退到 GPIO UART
+    if os.path.exists('/dev/ttyAS1'):
+        print('[UART] Fallback to GPIO: /dev/ttyAS1')
+        return '/dev/ttyAS1'
+
+    return '/dev/ttyUSB0'  # 最终回退
+
+UART_PORT = _find_uart()
 UART_BAUD = 115200
-UART_TIMEOUT = 0.01
+UART_TIMEOUT = 0.005  # 读超时 10ms→5ms, 减少阻塞
 
 # ============ 图像预处理 ============
 USE_CLAHE = os.environ.get('VISION_CLAHE', '1') != '0'
@@ -136,16 +160,17 @@ ADAPTIVE_V_THRESHOLD = os.environ.get('VISION_ADAPTIVE_V', '1') != '0'
 # ============ 跟踪器参数 ============
 TRACKER_SMOOTHING = float(os.environ.get('VISION_TRACK_SMOOTH', '0.30'))
 TRACKER_MAX_DIST = int(os.environ.get('VISION_TRACK_MAXDIST', '100'))
-TRACKER_MAX_LOST = int(os.environ.get('VISION_TRACK_MAXLOST', '8'))
+TRACKER_MAX_LOST = int(os.environ.get('VISION_TRACK_MAXLOST', '5'))
 TRACKER_PREDICT = os.environ.get('VISION_TRACK_PREDICT', '1') != '0'
+TRACKER_CONFIRM_FRAMES = int(os.environ.get('VISION_TRACK_CONFIRM', '2'))
 
 # ============ 帧率控制 ============
 TARGET_FPS = int(os.environ.get('VISION_FPS', '30'))
 
 # ============ 检测模式 ============
-# True: 只检测己方颜色(看到己方块后退, 其余依赖光电传感器)
-# False: 双色检测(蓝+黄全部检测, 分类友/敌)
-DETECT_OWN_ONLY = os.environ.get('VISION_OWN_ONLY', '1') != '0'
+# False: 双色检测(蓝+黄全部检测, 分类友/敌) — 推荐, STM32 能区分 E/F/N
+# True: 只检测己方颜色(看到己方块后退, 其余依赖光电传感器) — STM32 只收到 F/X
+DETECT_OWN_ONLY = os.environ.get('VISION_OWN_ONLY', '0') != '0'
 
 # ============ 目标优先级模式 (仅DETECT_OWN_ONLY=False时生效) ============
 # 'collect': N(中立)>E(敌方) — 以收集能量块得分为主
@@ -158,6 +183,21 @@ DISTANCE_FAR   = 3000    # 面积 < 此值 = 远距离
 
 # ============ Watchdog ============
 WATCHDOG_TIMEOUT = 30.0  # 连续无有效帧超时(s), 触发相机重启
+
+# ============ 检测优化 ============
+DETECT_HALF_RES = os.environ.get('VISION_HALF_RES', '1') != '0'  # 半分辨率检测
+ROI_PREDICT = os.environ.get('VISION_ROI_PREDICT', '1') != '0'   # ROI 预测加速
+ROI_FULL_SCAN_INTERVAL = int(os.environ.get('VISION_ROI_SCAN', '5'))  # 全帧扫描间隔
+DIRECTION_SMOOTH_WINDOW = int(os.environ.get('VISION_DIR_SMOOTH', '3'))  # 方向平滑窗口
+CLOSE_RANGE_RATIO = float(os.environ.get('VISION_CLOSE_RATIO', '0.40'))  # 近距离回退占比阈值
+
+# ============ AprilTag 辅助检测 ============
+TAG_DETECT_ENABLED = os.environ.get('VISION_TAG', '1') != '0'
+TAG_DETECT_INTERVAL = int(os.environ.get('VISION_TAG_INTERVAL', '3'))  # 每N帧检测一次
+TAG_BACKEND = os.environ.get('VISION_TAG_BACKEND', 'aruco')  # aruco/apriltag/qr
+TAG_ID_NEUTRAL = 0   # 中立能量块
+TAG_ID_BLUE = 1      # 蓝方能量块
+TAG_ID_YELLOW = 2    # 黄方能量块
 
 # ============ 标定文件自动加载 ============
 def _load_calibration():

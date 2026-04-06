@@ -46,15 +46,17 @@ class Target:
 
 
 class Tracker:
-    """帧间平滑跟踪器, 支持速度预测 + 面积约束 + 指数平滑"""
+    """帧间平滑跟踪器, 支持速度预测 + 面积约束 + 自适应平滑 + 新目标确认"""
 
-    def __init__(self, smoothing=0.15, max_dist=150, max_lost=8,
-                 color_switch_frames=3, enable_prediction=True):
+    def __init__(self, smoothing=0.15, max_dist=150, max_lost=5,
+                 color_switch_frames=3, enable_prediction=True,
+                 confirm_frames=2):
         self.smoothing = smoothing
         self.max_dist = max_dist
         self.max_lost = max_lost
         self.color_switch_frames = color_switch_frames
         self.enable_prediction = enable_prediction
+        self.confirm_frames = confirm_frames
         self._tracks = {}
         self._next_id = 0
 
@@ -77,13 +79,12 @@ class Tracker:
             for tid, tr in self._tracks.items():
                 if tid in used_tracks:
                     continue
-                # 用预测位置匹配, 而非上帧位置
                 px, py = self._predict_pos(tr)
                 d = ((px - t.cx) ** 2 + (py - t.cy) ** 2) ** 0.5
-                # 面积变化约束: 面积突变>3倍则不匹配
+                # 面积变化约束: 2× (收紧, 原3×)
                 if tr['area'] > 0:
                     area_ratio = t.area / tr['area']
-                    if area_ratio > 3.0 or area_ratio < 0.33:
+                    if area_ratio > 2.0 or area_ratio < 0.5:
                         continue
                 if d < best_dist:
                     best_dist = d
@@ -104,15 +105,19 @@ class Tracker:
                 else:
                     tr['color_switch_count'] = 0
 
-                # 更新速度 (当前位置 - 上帧位置)
+                # 更新速度
                 tr['vx'] = t.cx - tr['cx']
                 tr['vy'] = t.cy - tr['cy']
 
-                s = self.smoothing
+                # 自适应平滑: 快速运动→低平滑(跟紧), 慢速→高平滑(去抖)
+                speed = (tr['vx'] ** 2 + tr['vy'] ** 2) ** 0.5
+                s = max(0.05, min(0.4, self.smoothing - speed * 0.008))
+
                 tr['cx'] = int(tr['cx'] * s + t.cx * (1 - s))
                 tr['cy'] = int(tr['cy'] * s + t.cy * (1 - s))
                 tr['area'] = tr['area'] * s + t.area * (1 - s)
                 tr['lost'] = 0
+                tr['confirmed'] = True
                 used_tracks.add(best_id)
                 result.append(Target(t.color, tr['cx'], tr['cy'],
                                      t.x, t.y, t.w, t.h, tr['area'], t.solidity))
@@ -124,38 +129,72 @@ class Tracker:
                     'color': t.color, 'lost': 0,
                     'color_switch_count': 0,
                     'vx': 0, 'vy': 0,
+                    'confirmed': self.confirm_frames <= 1,
+                    'confirm_count': 1,
                 }
                 used_tracks.add(tid)
-                result.append(t)
+                # 新目标确认: 需连续 N 帧出现才输出
+                if self.confirm_frames <= 1:
+                    result.append(t)
 
-        # 清除丢失轨迹, 丢失时速度衰减
+        # 清除丢失轨迹, 丢失时速度快速衰减
         for tid, tr in list(self._tracks.items()):
             if tid not in used_tracks:
                 tr['lost'] += 1
-                tr['vx'] = int(tr['vx'] * 0.5)
-                tr['vy'] = int(tr['vy'] * 0.5)
+                tr['vx'] = int(tr['vx'] * 0.3)
+                tr['vy'] = int(tr['vy'] * 0.3)
                 if tr['lost'] > self.max_lost:
                     del self._tracks[tid]
+            else:
+                # 新目标确认计数
+                if not tr.get('confirmed', False):
+                    tr['confirm_count'] = tr.get('confirm_count', 0) + 1
+                    if tr['confirm_count'] >= self.confirm_frames:
+                        tr['confirmed'] = True
+
+        # 补充已确认但本轮未加入 result 的新确认目标
+        for tid, tr in self._tracks.items():
+            if tid in used_tracks and tr.get('confirmed') and tr.get('confirm_count', 0) == self.confirm_frames:
+                # 刚确认的目标, 补入 result
+                for t in targets:
+                    if abs(t.cx - tr['cx']) < 30 and abs(t.cy - tr['cy']) < 30:
+                        result.append(Target(t.color, tr['cx'], tr['cy'],
+                                             t.x, t.y, t.w, t.h, tr['area'], t.solidity))
+                        break
 
         return result
 
 
 class ColorDetector:
     def __init__(self, enable_tracking=True):
-        # 形态学核: open去噪点, close填空洞 (缩小以提升帧率)
+        # 形态学核: open去噪点, close填空洞
         self._kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # 小目标用小核, 大目标用大核
+        self._kernel_open_sm  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        self._kernel_close_sm = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self._kernel_open_lg  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._kernel_close_lg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         self._tracker = Tracker(
             smoothing=getattr(config, 'TRACKER_SMOOTHING', 0.15),
             max_dist=getattr(config, 'TRACKER_MAX_DIST', 150),
-            max_lost=getattr(config, 'TRACKER_MAX_LOST', 8),
+            max_lost=getattr(config, 'TRACKER_MAX_LOST', 5),
             enable_prediction=getattr(config, 'TRACKER_PREDICT', True),
+            confirm_frames=getattr(config, 'TRACKER_CONFIRM_FRAMES', 2),
         ) if enable_tracking else None
-        # CLAHE: 自适应直方图均衡
+        # CLAHE
         clip = getattr(config, 'CLAHE_CLIP_LIMIT', 1.5)
         tile = getattr(config, 'CLAHE_TILE_SIZE', 4)
         self._clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
+        self._clahe_half = cv2.createCLAHE(clipLimit=clip, tileGridSize=(2, 2))
         self._clahe_s = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(tile, tile))
+        # 光照 EMA
+        self._v_ema = 128.0
+        # 上帧最大目标面积 (用于自适应形态学核)
+        self._last_max_area = 0
+        # ROI 预测: 上帧目标 bbox
+        self._last_bboxes = []
+        self._frame_idx = 0
 
     # ------------------------------------------------------------------
     # 相机属性锁定 (已废弃 — 统一由 config.setup_camera() 处理)
@@ -169,20 +208,26 @@ class ColorDetector:
     # 预处理: CLAHE + 高斯模糊 → HSV
     # ------------------------------------------------------------------
     def _preprocess(self, frame):
-        """BGR → HSV, CLAHE均衡V+S通道以应对光照不均和低饱和度"""
+        """BGR → HSV, 可选半分辨率 + CLAHE均衡V通道 + 光照EMA"""
+        use_half = getattr(config, 'DETECT_HALF_RES', True)
+        if use_half:
+            frame = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2),
+                               interpolation=cv2.INTER_NEAREST)
         blurred = cv2.GaussianBlur(frame, (3, 3), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
         if getattr(config, 'USE_CLAHE', True):
             h, s, v = cv2.split(hsv)
-            v = self._clahe.apply(v)
-            # S通道CLAHE: 增强低饱和度目标的可检测性
-            if getattr(config, 'CLAHE_S_CHANNEL', True):
+            v = (self._clahe_half if use_half else self._clahe).apply(v)
+            if getattr(config, 'CLAHE_S_CHANNEL', False):
                 s = self._clahe_s.apply(s)
             hsv = cv2.merge([h, s, v])
 
-        # 缓存帧平均亮度, 供自适应阈值使用
-        self._frame_v_mean = hsv[:, :, 2].mean()
+        # 光照 EMA: 平滑帧间亮度变化
+        current_v = hsv[:, :, 2].mean()
+        self._v_ema = 0.9 * self._v_ema + 0.1 * current_v
+        self._frame_v_mean = self._v_ema
+        self._is_half_res = use_half
 
         return hsv
 
@@ -194,22 +239,29 @@ class ColorDetector:
         lower = hsv_range['lower'].copy()
         upper = hsv_range['upper'].copy()
 
-        # 自适应V阈值: 暗环境自动放宽V下限, 亮环境收紧减少噪声
+        # 连续自适应V阈值: 基于光照EMA平滑调整, 替代硬切换
         if (getattr(config, 'ADAPTIVE_V_THRESHOLD', True)
                 and color_name != 'white'):
-            v_mean = getattr(self, '_frame_v_mean', 128)
-            if v_mean < 80:
-                lower[2] = max(20, lower[2] - 25)   # 暗环境大幅放宽
-            elif v_mean < 120:
-                lower[2] = max(30, lower[2] - 10)   # 中等环境微调
-            elif v_mean > 180:
-                lower[2] = min(lower[2] + 15, 120)  # 过亮环境收紧
+            v_ema = getattr(self, '_v_ema', 128)
+            v_offset = int((128 - v_ema) * 0.3)
+            lower[2] = max(20, int(lower[2]) + v_offset)
 
         mask = cv2.inRange(hsv, lower, upper)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self._kernel_open)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel_close)
 
-        # 空间排斥: 减去已被其他颜色占据的区域
+        # 自适应形态学核: 根据上帧最大目标面积选择核大小
+        last_area = self._last_max_area
+        # 半分辨率下面积缩小4倍
+        area_th = last_area * 4 if getattr(self, '_is_half_res', False) else last_area
+        if area_th > 10000:
+            k_open, k_close = self._kernel_open_lg, self._kernel_close_lg
+        elif area_th < 2000:
+            k_open, k_close = self._kernel_open_sm, self._kernel_close_sm
+        else:
+            k_open, k_close = self._kernel_open, self._kernel_close
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+
         if exclusion_mask is not None:
             mask = cv2.bitwise_and(mask, cv2.bitwise_not(exclusion_mask))
 
@@ -223,6 +275,12 @@ class ColorDetector:
             min_area = getattr(config, 'MIN_CONTOUR_AREA_YELLOW', config.MIN_CONTOUR_AREA)
         else:
             min_area = config.MIN_CONTOUR_AREA
+
+        # 半分辨率下面积阈值缩小4倍
+        is_half = getattr(self, '_is_half_res', False)
+        if is_half:
+            min_area = min_area // 4
+
         base_solidity = 0.65 if color_name == 'white' else 0.3
         min_aspect = 0.5 if color_name == 'white' else config.MIN_ASPECT_RATIO
         max_aspect = 2.0 if color_name == 'white' else config.MAX_ASPECT_RATIO
@@ -230,42 +288,61 @@ class ColorDetector:
         targets = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            # 黄色使用专用面积上限，过滤整片暖色背景大轮廓
             max_area = (getattr(config, 'MAX_CONTOUR_AREA_YELLOW', config.MAX_CONTOUR_AREA)
                         if color_name == 'yellow' else config.MAX_CONTOUR_AREA)
+            if is_half:
+                max_area = max_area // 4
             if area < min_area or area > max_area:
                 continue
 
             x, y, w, h = cv2.boundingRect(cnt)
 
-            # 大轮廓(>50000)跳过宽高比检查: 近距离色块可能部分超出画面
-            if area < 50000:
+            # 大轮廓跳过宽高比检查
+            area_full = area * 4 if is_half else area
+            if area_full < 50000:
                 aspect = w / h if h > 0 else 0
                 if aspect < min_aspect or aspect > max_aspect:
                     continue
 
             hull_area = cv2.contourArea(cv2.convexHull(cnt))
             solidity = area / hull_area if hull_area > 0 else 0
-            # 大面积轮廓放宽solidity: 多目标合并/边缘截断时轮廓不规则
-            min_solidity = base_solidity if area < 5000 else 0.15
+            min_solidity = base_solidity if area_full < 5000 else 0.15
             if solidity < min_solidity:
                 continue
 
-            # 二阶段 S 均值验证 (黄色专用):
-            # 宽 H mask 捕获所有候选, 用轮廓内 S 均值区分真黄色 vs 蓝色冒充
+            # H 通道二次验证: 小目标检查颜色纯度
+            if area_full < 5000 and color_name in ('blue', 'yellow'):
+                contour_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+                cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
+                h_pixels = hsv[:, :, 0][contour_mask > 0]
+                if len(h_pixels) > 10 and h_pixels.std() > 25:
+                    continue  # H 标准差过大, 非纯色块
+
+            # 黄色 S 均值验证
             s_mean_min = getattr(config, 'YELLOW_S_MEAN_MIN', 0)
             if color_name == 'yellow' and s_mean_min > 0:
                 contour_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
                 cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
                 s_pixels = hsv[:, :, 1][contour_mask > 0]
                 if len(s_pixels) > 0 and s_pixels.mean() < s_mean_min:
-                    continue  # S 均值过低, 判为蓝色冒充
+                    continue
 
-            cx = x + w // 2
-            cy = y + h // 2
+            # 半分辨率坐标映射回全分辨率
+            if is_half:
+                cx = (x + w // 2) * 2
+                cy = (y + h // 2) * 2
+                x, y, w, h = x * 2, y * 2, w * 2, h * 2
+                area = area * 4
+            else:
+                cx = x + w // 2
+                cy = y + h // 2
+
             targets.append(Target(color_name, cx, cy, x, y, w, h, area, solidity))
 
         targets.sort(key=lambda t: t.area, reverse=True)
+        # 更新上帧最大面积
+        if targets:
+            self._last_max_area = int(targets[0].area)
         return targets[:config.MAX_TARGETS]
 
     # ------------------------------------------------------------------
@@ -294,6 +371,9 @@ class ColorDetector:
         if roi_pixels == 0:
             return []
 
+        close_ratio = getattr(config, 'CLOSE_RANGE_RATIO', 0.40)
+        is_half = getattr(self, '_is_half_res', False)
+
         for color_name, hsv_range in [('blue', config.HSV_BLUE),
                                        ('yellow', config.HSV_YELLOW)]:
             lower = hsv_range['lower'].copy()
@@ -301,28 +381,46 @@ class ColorDetector:
                 lower[1] = max(0, lower[1] - 30)
             mask = cv2.inRange(roi, lower, hsv_range['upper'])
             ratio = cv2.countNonZero(mask) / roi_pixels
-            if ratio > 0.30:
-                # 二阶段 S 均值验证 (黄色专用)
+            if ratio > close_ratio:
+                # H 通道一致性检查
+                h_pixels = roi[:, :, 0][mask > 0]
+                if len(h_pixels) > 50 and h_pixels.std() > 30:
+                    continue  # H 分布过散, 非纯色块
+                # 黄色 S 均值验证
                 s_mean_min = getattr(config, 'YELLOW_S_MEAN_MIN', 0)
                 if color_name == 'yellow' and s_mean_min > 0:
                     s_pixels = roi[:, :, 1][mask > 0]
                     if len(s_pixels) > 0 and s_pixels.mean() < s_mean_min:
-                        continue  # S 均值过低, 蓝色冒充
-                cx, cy = fw // 2, fh // 2
-                area = int(ratio * fw * fh)
-                return [Target(color_name, cx, cy,
-                               fw // 4, fh // 4, fw // 2, fh // 2, area)]
+                        continue
+                # 映射回全分辨率坐标
+                if is_half:
+                    cx, cy = fw, fh  # half的中心 * 2
+                    area = int(ratio * fw * fh * 4)
+                    return [Target(color_name, cx, cy,
+                                   fw // 2, fh // 2, fw, fh, area)]
+                else:
+                    cx, cy = fw // 2, fh // 2
+                    area = int(ratio * fw * fh)
+                    return [Target(color_name, cx, cy,
+                                   fw // 4, fh // 4, fw // 2, fh // 2, area)]
         return []
 
     def detect(self, frame):
         """
         检测一帧中蓝色和黄色目标 (双色模式)。
-        流程: 预处理 → 蓝/黄轮廓检测 → (无结果时) ROI近距离回退 → 跟踪平滑
+        流程: 预处理 → 蓝色检测 → 蓝色排斥掩码 → 黄色检测 → 近距离回退 → 跟踪平滑
         """
         hsv = self._preprocess(frame)
 
+        # 蓝色优先检测
         blue_targets = self._detect_color(hsv, 'blue', config.HSV_BLUE)
-        yellow_targets = self._detect_color(hsv, 'yellow', config.HSV_YELLOW)
+
+        # 蓝色区域生成排斥掩码, 防止蓝色反光被误识别为黄色
+        blue_excl = self._build_exclusion_mask(
+            hsv.shape[:2], blue_targets, dilate_px=20)
+
+        yellow_targets = self._detect_color(
+            hsv, 'yellow', config.HSV_YELLOW, exclusion_mask=blue_excl)
 
         all_targets = blue_targets + yellow_targets
 
@@ -364,25 +462,35 @@ class ColorDetector:
         if roi_pixels == 0:
             return []
 
+        close_ratio = getattr(config, 'CLOSE_RANGE_RATIO', 0.40)
+        is_half = getattr(self, '_is_half_res', False)
+
         lower = hsv_range['lower'].copy()
-        # 蓝色放宽S以检测近距离大面积; 黄色不放宽避免背景误触发
         if color_name != 'yellow':
             lower[1] = max(0, lower[1] - 30)
         mask = cv2.inRange(roi, lower, hsv_range['upper'])
         ratio = cv2.countNonZero(mask) / roi_pixels
-        min_ratio = 0.30
-        if ratio > min_ratio:
-            # 二阶段 S 均值验证 (黄色专用)
+        if ratio > close_ratio:
+            # H 通道一致性检查
+            h_pixels = roi[:, :, 0][mask > 0]
+            if len(h_pixels) > 50 and h_pixels.std() > 30:
+                return []
+            # 黄色 S 均值验证
             s_mean_min = getattr(config, 'YELLOW_S_MEAN_MIN', 0)
             if color_name == 'yellow' and s_mean_min > 0:
                 s_pixels = roi[:, :, 1][mask > 0]
                 if len(s_pixels) > 0 and s_pixels.mean() < s_mean_min:
-                    return []  # S 均值过低, 蓝色冒充
-
-            cx, cy = fw // 2, fh // 2
-            area = int(ratio * fw * fh)
-            return [Target(color_name, cx, cy,
-                           fw // 4, fh // 4, fw // 2, fh // 2, area)]
+                    return []
+            if is_half:
+                cx, cy = fw, fh
+                area = int(ratio * fw * fh * 4)
+                return [Target(color_name, cx, cy,
+                               fw // 2, fh // 2, fw, fh, area)]
+            else:
+                cx, cy = fw // 2, fh // 2
+                area = int(ratio * fw * fh)
+                return [Target(color_name, cx, cy,
+                               fw // 4, fh // 4, fw // 2, fh // 2, area)]
         return []
 
     def classify(self, targets, my_color):
@@ -460,12 +568,30 @@ class ColorDetector:
 class TagDetector:
     """AprilTag / QR 码检测器 — 收集模式下识别能量块标签。
 
-    默认使用 OpenCV 内置 QRCodeDetector (零依赖)。
+    默认使用 OpenCV 内置 ArUco (DICT_APRILTAG_36h11, 零依赖)。
     如需 AprilTag: pip install pupil-apriltags, 修改 backend='apriltag'。
     """
 
-    def __init__(self, backend='qr'):
-        self.backend = backend
+    # Tag ID → 类型映射
+    @staticmethod
+    def classify_tag(tag_id, my_color):
+        """根据 Tag ID 和己方颜色返回目标类型字符。
+        tag_id: 0=中立, 1=蓝方, 2=黄方
+        返回: 'E'=敌方, 'F'=友方, 'N'=中立
+        """
+        tag_id = int(tag_id)
+        neutral_id = getattr(config, 'TAG_ID_NEUTRAL', 0)
+        blue_id = getattr(config, 'TAG_ID_BLUE', 1)
+        yellow_id = getattr(config, 'TAG_ID_YELLOW', 2)
+        if tag_id == neutral_id:
+            return 'N'
+        if my_color == 'b':
+            return 'F' if tag_id == blue_id else 'E'
+        else:
+            return 'F' if tag_id == yellow_id else 'E'
+
+    def __init__(self, backend=None):
+        self.backend = backend or getattr(config, 'TAG_BACKEND', 'aruco')
         if backend == 'qr':
             self._qr = cv2.QRCodeDetector()
         elif backend == 'aruco':
