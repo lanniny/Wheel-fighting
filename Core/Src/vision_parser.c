@@ -115,6 +115,30 @@ static void parse_frame(const uint8_t *buf, uint16_t size)
 }
 
 /* ------------------------------------------------------------------ */
+/* 内部函数: 多帧解析 — 遍历缓冲区解析所有完整帧                       */
+/* ------------------------------------------------------------------ */
+static void parse_buffer(const uint8_t *buf, uint16_t size)
+{
+    uint16_t pos = 0;
+    while (pos < size)
+    {
+        /* find '$' */
+        while (pos < size && buf[pos] != '$') pos++;
+        if (pos >= size) break;
+
+        /* find '\n' */
+        uint16_t start = pos;
+        uint16_t end = pos + 1;
+        while (end < size && buf[end] != '\n') end++;
+        if (end >= size) break;
+
+        /* parse this frame (last valid frame wins) */
+        parse_frame(buf + start, end - start + 1);
+        pos = end + 1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* HAL回调: DMA接收完成 或 IDLE线触发                                  */
 /* ------------------------------------------------------------------ */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
@@ -123,9 +147,9 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 
     vision_rx_total++;
 
-    /* 解析本次接收到的数据 */
+    /* 多帧解析: 处理缓冲区中所有完整帧 */
     if (Size > 0u) {
-        parse_frame(dma_rx_buf, Size);
+        parse_buffer(dma_rx_buf, Size);
     }
 
     /* 立即重启DMA接收, 准备下一帧 */

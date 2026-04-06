@@ -40,7 +40,7 @@ void Robot_Control_Update(void)
             if (Roaming_IsForward() && vision_ok
                 && (vision_target.type == 'N' || vision_target.type == 'E'))
             {
-                MOTOR_StopAll();
+                MOTOR_BrakeAll();
                 Fight_Init();
                 robot_state = ROBOT_ATTACK;
                 enemy_confirm_count = 0;
@@ -54,7 +54,7 @@ void Robot_Control_Update(void)
                 enemy_confirm_count++;
                 if (enemy_confirm_count >= 2)
                 {
-                    MOTOR_StopAll();
+                    MOTOR_BrakeAll();
                     Fight_Init();
                     robot_state = ROBOT_ATTACK;
                     enemy_confirm_count = 0;
@@ -67,7 +67,7 @@ void Robot_Control_Update(void)
 
             if (Roaming_IsDone())
             {
-                MOTOR_StopAll();
+                MOTOR_BrakeAll();
                 Backup_Init();
                 robot_state = ROBOT_BACKUP;
                 enemy_confirm_count = 0;
@@ -79,7 +79,7 @@ void Robot_Control_Update(void)
             Fight_Update();
             if (Fight_IsDown())
             {
-                MOTOR_StopAll();
+                MOTOR_BrakeAll();
                 Backup_Init();
                 robot_state = ROBOT_BACKUP;
                 enemy_confirm_count = 0;

@@ -21,21 +21,29 @@ static uint32_t Roaming_TurnTime = ROAMING_TURN_TIME;
 static RoamingBackReason Roaming_PendingBackReason = BACK_REASON_NONE;
 static uint32_t Roaming_BackDebounceStart = 0;
 
+/* 灰度掉台消抖 */
+#define SHADE_DOWN_THRESHOLD  2.85f
+#define SHADE_DOWN_CONFIRM    5
+static uint8_t Roaming_ShadeDownCount = 0;
+
 /**
- * @description: 检测是否掉落擂台
+ * @description: 检测是否掉落擂台 (滤波+消抖, 连续5次确认)
  * @param void
  * @return int 1=掉落擂台, 0=在擂台上
  */
 static int detect_shade(void)
 {
-    site_detect_shade();//read shade sensor data
+    site_detect_shade();
 
-    if(voltage[0] > 2.7f && voltage[1] > 2.7f)
+    if(voltage_filtered[0] > SHADE_DOWN_THRESHOLD
+       && voltage_filtered[1] > SHADE_DOWN_THRESHOLD)
     {
-        return 1;
+        Roaming_ShadeDownCount++;
+        return (Roaming_ShadeDownCount >= SHADE_DOWN_CONFIRM) ? 1 : 0;
     }
     else
     {
+        Roaming_ShadeDownCount = 0;
         return 0;
     }
 }
@@ -54,6 +62,7 @@ void Roaming_Init(void)
     Roaming_BackReason = BACK_REASON_NONE;
     Roaming_PendingBackReason = BACK_REASON_NONE;
     Roaming_BackDebounceStart = 0;
+    Roaming_ShadeDownCount = 0;
 }
 
 /**
@@ -66,12 +75,12 @@ void Roaming_Update(void)
     uint32_t current_time = HAL_GetTick();
     uint32_t elapsed_time = current_time - Roaming_StartTime;
 
-    // 检测到掉台信号时，立即停机
+    // 检测到掉台信号时，主动制动
     if(detect_shade())
     {
         Roaming_Stage = ROAMING_DONE;
         Roaming_Done = true;
-        MOTOR_StopAll();
+        MOTOR_BrakeAll();
         return;
     }
 
@@ -114,9 +123,10 @@ void Roaming_Update(void)
             }
             else if((current_time - Roaming_BackDebounceStart) >= ROAMING_EDGE_DEBOUNCE_MS)
             {
+                MOTOR_BrakeAll();
                 Roaming_BackReason = current_reason;
                 Roaming_Stage = ROAMING_BACK;
-                Roaming_StartTime = current_time;
+                Roaming_StartTime = HAL_GetTick();
                 Roaming_PendingBackReason = BACK_REASON_NONE;
                 Roaming_BackDebounceStart = 0;
             }

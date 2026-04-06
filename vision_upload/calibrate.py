@@ -108,17 +108,14 @@ def main():
     global current_color
     colors_to_cal = [args.color] if args.color else ['blue', 'yellow', 'white']
 
-    # Open camera
+    # Open camera (统一使用 config.setup_camera 确保与运行时一致)
     dev = config.find_camera()
     print(f'Camera: {dev}')
     cap = cv2.VideoCapture(dev)
     if not cap.isOpened():
         print('Cannot open camera')
         return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
-    for _ in range(5):
-        cap.read()
+    config.setup_camera(cap)
 
     results = {}
 

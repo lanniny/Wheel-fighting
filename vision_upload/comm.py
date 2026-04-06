@@ -12,6 +12,7 @@ UART 通信模块 v3 - 自动重连 + 颜色心跳 + 炸弹类型支持
 协议 (STM32 -> LubanCat): 单字节指令
   'b' = 己方蓝色      'y' = 己方黄色
   's' = 开始识别      'p' = 暂停识别
+  'c' = 收集模式      'f' = 战斗模式
 """
 import time
 import config
@@ -28,9 +29,11 @@ class UartComm:
     def __init__(self):
         self.ser = None
         self.my_color = 'b'
+        self.mode = 'fight'          # 'fight'=格斗(颜色检测) / 'collect'=收集(Tag检测)
         self.active = True           # 是否激活发送
+        self._color_changed = False  # 颜色切换标志, 供主循环检测并切换WB
         self._last_send = 0.0
-        self._send_interval = 0.033  # 最高 30Hz 发送频率
+        self._send_interval = 0.050  # 最高 20Hz 发送频率 (30Hz→20Hz, 降低UART压力)
         self._no_target_interval = 0.2  # 无目标时降到 5Hz, 节省带宽
         self._tx_errors = 0
         self._last_reconnect = 0.0
@@ -52,7 +55,7 @@ class UartComm:
                 port=config.UART_PORT,
                 baudrate=config.UART_BAUD,
                 timeout=config.UART_TIMEOUT,
-                write_timeout=0.01,
+                write_timeout=0.05,
             )
             self._tx_errors = 0
             print(f'UART opened: {config.UART_PORT} @ {config.UART_BAUD}')
@@ -112,13 +115,22 @@ class UartComm:
             for byte in reversed(data):
                 ch = chr(byte)
                 if ch in ('b', 'y'):
+                    old = self.my_color
                     self.my_color = ch
+                    if old != ch:
+                        self._color_changed = True
                     return ch
                 if ch == 's':
                     self.active = True
                     return ch
                 if ch == 'p':
                     self.active = False
+                    return ch
+                if ch == 'c':
+                    self.mode = 'collect'
+                    return ch
+                if ch == 'f':
+                    self.mode = 'fight'
                     return ch
         except Exception:
             pass
@@ -195,6 +207,59 @@ class UartComm:
     # ------------------------------------------------------------------
     # 高层接口
     # ------------------------------------------------------------------
+    def send_tag(self, tag):
+        """
+        发送 Tag 检测结果给 STM32。
+        tag: {'id': int|str, 'cx': int, 'cy': int, 'area': int}
+        协议: $T,tag_id,cx,cy,area,dir*CS\n
+        """
+        if not self.active:
+            return
+        now = time.time()
+        if now - self._last_send < self._send_interval:
+            return
+        if not self.ser:
+            self._try_reconnect()
+            return
+
+        cx = tag.get('cx', 0)
+        cy = tag.get('cy', 0)
+        area = tag.get('area', 0)
+        direction = (cx - config.CAMERA_WIDTH / 2) / (config.CAMERA_WIDTH / 2)
+        tag_id_raw = tag.get('id', 0)
+        try:
+            tag_id = int(tag_id_raw)
+        except (TypeError, ValueError):
+            print(f'[UART] Drop invalid tag id: {tag_id_raw!r}')
+            return
+
+        self._tx_total += 1
+        try:
+            dir_int = max(-100, min(100, int(direction * 100)))
+            body = f'T,{tag_id},{cx},{cy},{int(area)},{dir_int:+d}'
+            cs = self._checksum(body)
+            msg = f'${body}*{cs}\n'
+            self.ser.write(msg.encode())
+            self._last_send = now
+            self._tx_errors = 0
+            self._tx_success += 1
+        except Exception as e:
+            self._tx_errors += 1
+            if self._tx_errors >= self._TX_ERROR_THRESHOLD:
+                print(f'[UART] TX error #{self._tx_errors}: {e}, reconnecting')
+                self._try_reconnect()
+
+    def send_own_detection(self, own_targets):
+        """
+        单色策略: 检测到己方能量块→F(后退), 未检测到→X(自由行动)。
+        own_targets: detect_own() 返回的目标列表
+        """
+        if own_targets:
+            t = own_targets[0]
+            self.send_target('F', t.cx, t.cy, t.area, t.direction)
+        else:
+            self.send_target('X')
+
     def send_from_detection(self, friends, enemies, neutrals, bombs=None):
         """
         根据优先级发送最重要目标, 尊重 config.PRIORITY_MODE:

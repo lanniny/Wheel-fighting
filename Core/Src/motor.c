@@ -59,6 +59,29 @@ void MOTOR_StopAll(void)
     MOTOR_SetSpeed(MOTOR_4, 0);
 }
 
+void MOTOR_Brake(MOTOR_ID motor_id)
+{
+    switch(motor_id)
+    {
+        case MOTOR_1:
+        case MOTOR_2:
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, PWM_MAX_VALUE);
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, PWM_MAX_VALUE);
+            break;
+        case MOTOR_3:
+        case MOTOR_4:
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, PWM_MAX_VALUE);
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, PWM_MAX_VALUE);
+            break;
+    }
+}
+
+void MOTOR_BrakeAll(void)
+{
+    MOTOR_Brake(MOTOR_1);
+    MOTOR_Brake(MOTOR_3);
+}
+
 void drive_For_L(void)//前进(低中高)
 {
     MOTOR_SetSpeed(MOTOR_1, SPEED_LOW);

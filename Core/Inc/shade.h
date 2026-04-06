@@ -12,6 +12,7 @@
 #include "main.h"
 extern uint16_t shade[2];//adc value
 extern float voltage[2];//voltage value
+extern float voltage_filtered[2];//filtered voltage (sliding avg)
 
 void Shade_Sensor_Init(void);
 void site_detect_shade(void);

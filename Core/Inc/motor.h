@@ -64,5 +64,7 @@ void drive_ArcLeft_M(void);    // 中速弧线左 (ENGAGE前侧追踪用)
 void drive_ArcRight_M(void);   // 中速弧线右
 
 void MOTOR_StopAll(void);
+void MOTOR_Brake(MOTOR_ID motor_id);
+void MOTOR_BrakeAll(void);
 
 #endif
