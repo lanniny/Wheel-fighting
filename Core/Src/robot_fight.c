@@ -6,8 +6,6 @@
 #include "vision_parser.h"
 #include "usart.h"
 
-extern float voltage[2];
-
 static FightState Fight_State = FIGHT_ENGAGE;
 static uint32_t Fight_StartTime = 0;
 static bool Fight_DoneFlag = false;
@@ -18,9 +16,7 @@ static uint32_t Fight_EngageLost = 0;     // ENGAGE中丢失目标的起始时�
 static EnemyDir Fight_PrevRawDir = DIR_NONE;
 static EnemyDir Fight_StableDir  = DIR_NONE;
 
-/* 灰度掉台消抖计数 */
-#define SHADE_DOWN_THRESHOLD  2.85f
-#define SHADE_DOWN_CONFIRM    5
+/* 灰度掉台消抖计数 (阈值定义在 shade.h) */
 static uint8_t Fight_ShadeDownCount = 0;
 
 /* 视觉追踪PD控制 v2: 死区+转向承诺 */
@@ -42,6 +38,10 @@ static void Fight_VisionChase(void)
     int16_t base = SPEED_MEDIUM;
     uint32_t now = HAL_GetTick();
 
+    /* 距离自适应基础速度 (在死区和PD路径之前统一计算) */
+    if(vision_target.area > 15000) base = SPEED_LOW;
+    else if(vision_target.area < 3000) base = SPEED_HIGH;
+
     /* 死区: 目标基本居中, 直走 */
     if(d > -VISION_DEADZONE && d < VISION_DEADZONE)
     {
@@ -56,10 +56,8 @@ static void Fight_VisionChase(void)
         }
         else
         {
-            /* 距离自适应直走 */
-            if(vision_target.area > 15000) drive_For_L();
-            else if(vision_target.area < 3000) drive_For_H();
-            else drive_For_M();
+            /* 直走 (base已根据距离自适应) */
+            drive_user_defined(base, base);
         }
         prev_vision_dir = d;
         return;
@@ -90,9 +88,7 @@ static void Fight_VisionChase(void)
         turn_commit_time = now;
     }
 
-    /* 距离自适应基础速度 */
-    if(vision_target.area > 15000) base = SPEED_LOW;
-    else if(vision_target.area < 3000) base = SPEED_HIGH;
+    /* base已在函数顶部根据距离自适应 */
 
     int16_t left  = base + turn;
     int16_t right = base - turn;
@@ -140,11 +136,22 @@ static bool Fight_EdgeDetected(void)
 }
 
 /**
- * @description: 掉台检测(灰度传感器 滤波+消抖)
+ * @description: 掉台检测(灰度传感器 滤波+消抖 + 原始值紧急快速通道)
+ *   正常路径: voltage_filtered > 2.85V 连续5次确认 (50ms)
+ *   紧急路径: voltage raw > 3.10V 双传感器, 跳过滤波直接确认 (0ms)
  */
 static bool Fight_DetectShade(void)
 {
     site_detect_shade();
+
+    /* 紧急快速通道: 原始值极高 = 确定掉台, 跳过滤波延迟 */
+    if(voltage[0] > SHADE_RAW_EMERGENCY
+       && voltage[1] > SHADE_RAW_EMERGENCY)
+    {
+        return true;
+    }
+
+    /* 正常路径: 滤波值 + 连续确认 */
     if(voltage_filtered[0] > SHADE_DOWN_THRESHOLD
        && voltage_filtered[1] > SHADE_DOWN_THRESHOLD)
     {

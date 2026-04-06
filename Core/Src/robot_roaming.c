@@ -11,8 +11,6 @@
 #include "obstacle.h"
 #include "motor.h"
 
-extern float voltage[2];
-
 static RoamingState Roaming_Stage = ROAMING_FORWARD;
 static uint32_t Roaming_StartTime = 0;
 static bool Roaming_Done = false;
@@ -21,20 +19,26 @@ static uint32_t Roaming_TurnTime = ROAMING_TURN_TIME;
 static RoamingBackReason Roaming_PendingBackReason = BACK_REASON_NONE;
 static uint32_t Roaming_BackDebounceStart = 0;
 
-/* 灰度掉台消抖 */
-#define SHADE_DOWN_THRESHOLD  2.85f
-#define SHADE_DOWN_CONFIRM    5
+/* 灰度掉台消抖 (阈值定义在 shade.h) */
 static uint8_t Roaming_ShadeDownCount = 0;
 
 /**
- * @description: 检测是否掉落擂台 (滤波+消抖, 连续5次确认)
- * @param void
- * @return int 1=掉落擂台, 0=在擂台上
+ * @description: 检测是否掉落擂台
+ *   正常路径: 滤波+消抖 (50ms延迟, 防误触)
+ *   紧急路径: 原始值极高, 零延迟确认
  */
 static int detect_shade(void)
 {
     site_detect_shade();
 
+    /* 紧急快速通道: 原始值极高 = 确定掉台 */
+    if(voltage[0] > SHADE_RAW_EMERGENCY
+       && voltage[1] > SHADE_RAW_EMERGENCY)
+    {
+        return 1;
+    }
+
+    /* 正常路径: 滤波值 + 连续确认 */
     if(voltage_filtered[0] > SHADE_DOWN_THRESHOLD
        && voltage_filtered[1] > SHADE_DOWN_THRESHOLD)
     {

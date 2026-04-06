@@ -10,9 +10,15 @@
 #define SHADE_H
 
 #include "main.h"
+
 extern uint16_t shade[2];//adc value
 extern float voltage[2];//voltage value
 extern float voltage_filtered[2];//filtered voltage (sliding avg)
+
+/* 掉台检测统一阈值 (shared across fight/roaming) */
+#define SHADE_DOWN_THRESHOLD  2.85f  /* 滤波值阈值 */
+#define SHADE_DOWN_CONFIRM    5      /* 连续确认次数 (50ms@10ms loop) */
+#define SHADE_RAW_EMERGENCY   3.10f  /* 原始值紧急阈值: 跳过滤波直接确认 */
 
 void Shade_Sensor_Init(void);
 void site_detect_shade(void);
