@@ -316,5 +316,8 @@ class UartComm:
         elif second:
             t = second[0]
             self.send_target(second_type, t.cx, t.cy, t.area, t.direction)
+        elif friends:
+            t = friends[0]
+            self.send_target('F', t.cx, t.cy, t.area, t.direction)
         else:
             self.send_target('X')
