@@ -106,7 +106,7 @@ HSV_YELLOW = {
 }
 # 黄色二阶段验证: 轮廓内 S 均值必须 > 此值, 否则判为蓝色冒充
 # (Realtek相机在WB=6000K下: 黄色S≈134, 蓝色S≈97, 阈值120分离)
-YELLOW_S_MEAN_MIN = int(os.environ.get('VISION_YELLOW_S_MEAN', '120'))
+YELLOW_S_MEAN_MIN = int(os.environ.get('VISION_YELLOW_S_MEAN', '70'))
 
 HSV_WHITE = {
     'lower': np.array([0, 0, 230]),
@@ -115,12 +115,20 @@ HSV_WHITE = {
 
 # ============ 检测参数 ============
 MIN_CONTOUR_AREA = 600
-MIN_CONTOUR_AREA_YELLOW = 20000  # 黄色专用: 过滤背景暖色调小噪声
-MAX_CONTOUR_AREA_YELLOW = 70000  # 黄色专用: 过滤整片暖色背景大轮廓
+MIN_CONTOUR_AREA_YELLOW = int(os.environ.get('VISION_YELLOW_MIN_AREA', '1500'))  # 与蓝色同量级, 远距离可检测
+MAX_CONTOUR_AREA_YELLOW = int(os.environ.get('VISION_YELLOW_MAX_AREA', '80000'))
 MAX_CONTOUR_AREA = 280000   # 280000 ≈ 91% of 640×480, 支持近距离大面积色块
 MIN_ASPECT_RATIO = 0.3
 MAX_ASPECT_RATIO = 3.0
 MAX_TARGETS = 10
+
+# ============ 黄色增强过滤 (替代面积暴力阈值) ============
+YELLOW_CIRCULARITY_MIN = float(os.environ.get('VISION_YELLOW_CIRC', '0.35'))  # 圆度下限, 能量块~0.5-0.8
+YELLOW_H_STD_MAX = int(os.environ.get('VISION_YELLOW_H_STD', '18'))           # H通道标准差上限
+FRAME_BOTTOM_EXCLUDE = float(os.environ.get('VISION_BOTTOM_EXCL', '0.12'))    # 忽略画面底部12%
+
+# ============ 友方近距离报警 (双色模式防误发F) ============
+FRIEND_ALERT_AREA = int(os.environ.get('VISION_FRIEND_ALERT', '15000'))  # 友方面积>此值才发F
 
 # ============ 串口通信 (支持环境变量覆盖) ============
 def _find_uart():

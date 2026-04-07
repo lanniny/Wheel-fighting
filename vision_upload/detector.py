@@ -310,12 +310,31 @@ class ColorDetector:
             if solidity < min_solidity:
                 continue
 
+            # 底部画幅排除 (黄色专用): 台面近距离区域暖色反光集中
+            if color_name == 'yellow':
+                bottom_exclude = getattr(config, 'FRAME_BOTTOM_EXCLUDE', 0.12)
+                if bottom_exclude > 0:
+                    frame_h = hsv.shape[0]
+                    if (y + h) > frame_h * (1 - bottom_exclude):
+                        continue
+
+            # 圆度过滤 (黄色专用): 能量块圆柱体~0.5-0.8, 噪声<0.3
+            if color_name == 'yellow':
+                circ_min = getattr(config, 'YELLOW_CIRCULARITY_MIN', 0.35)
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter > 0:
+                    circularity = 4 * 3.14159 * area / (perimeter * perimeter)
+                    if circularity < circ_min:
+                        continue
+
             # H 通道二次验证: 小目标检查颜色纯度
+            h_std_max = getattr(config, 'YELLOW_H_STD_MAX', 18)
             if area_full < 5000 and color_name in ('blue', 'yellow'):
                 contour_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
                 cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
                 h_pixels = hsv[:, :, 0][contour_mask > 0]
-                if len(h_pixels) > 10 and h_pixels.std() > 25:
+                std_limit = h_std_max if color_name == 'yellow' else 25
+                if len(h_pixels) > 10 and h_pixels.std() > std_limit:
                     continue  # H 标准差过大, 非纯色块
 
             # 黄色 S 均值验证

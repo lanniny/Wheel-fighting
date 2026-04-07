@@ -278,12 +278,16 @@ class UartComm:
 
     def send_own_detection(self, own_targets):
         """
-        单色策略: 检测到己方能量块→F(后退), 未检测到→X(自由行动)。
+        单色策略: 仅当己方能量块极近时发 F(后退), 远距离不回避。
         own_targets: detect_own() 返回的目标列表
         """
         if own_targets:
             t = own_targets[0]
-            self.send_target('F', t.cx, t.cy, t.area, t.direction)
+            alert_area = getattr(config, 'FRIEND_ALERT_AREA', 15000)
+            if t.area >= alert_area:
+                self.send_target('F', t.cx, t.cy, t.area, t.direction)
+            else:
+                self.send_target('X')
         else:
             self.send_target('X')
 
@@ -317,7 +321,12 @@ class UartComm:
             t = second[0]
             self.send_target(second_type, t.cx, t.cy, t.area, t.direction)
         elif friends:
+            # 双色模式: 仅当友方极近时才发 F, 远距离发 X 让 STM32 依赖红外
+            alert_area = getattr(config, 'FRIEND_ALERT_AREA', 15000)
             t = friends[0]
-            self.send_target('F', t.cx, t.cy, t.area, t.direction)
+            if t.area >= alert_area:
+                self.send_target('F', t.cx, t.cy, t.area, t.direction)
+            else:
+                self.send_target('X')
         else:
             self.send_target('X')
