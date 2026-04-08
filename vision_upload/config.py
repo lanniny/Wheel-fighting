@@ -199,6 +199,16 @@ ROI_FULL_SCAN_INTERVAL = int(os.environ.get('VISION_ROI_SCAN', '5'))  # 全帧�
 DIRECTION_SMOOTH_WINDOW = int(os.environ.get('VISION_DIR_SMOOTH', '3'))  # 方向平滑窗口
 CLOSE_RANGE_RATIO = float(os.environ.get('VISION_CLOSE_RATIO', '0.40'))  # 近距离回退占比阈值
 
+# ============ 掉台回复 - 黑色(台面)检测 ============
+HSV_BLACK = {
+    'lower': np.array([0, 0, 0]),
+    'upper': np.array([180,
+                       int(os.environ.get('VISION_BLACK_S_MAX', '100')),
+                       int(os.environ.get('VISION_BLACK_V_MAX', '60'))]),
+}
+DROP_BLACK_RATIO_THRESHOLD = float(os.environ.get('VISION_DROP_BLACK_RATIO', '0.55'))
+DROP_SEND_INTERVAL = float(os.environ.get('VISION_DROP_INTERVAL', '0.05'))  # 20Hz
+
 # ============ AprilTag 辅助检测 ============
 TAG_DETECT_ENABLED = os.environ.get('VISION_TAG', '1') != '0'
 TAG_DETECT_INTERVAL = int(os.environ.get('VISION_TAG_INTERVAL', '3'))  # 每N帧检测一次

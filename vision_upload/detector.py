@@ -523,6 +523,56 @@ class ColorDetector:
         neutrals = []  # 白色检测已移除
         return friends, enemies, neutrals
 
+    # ------------------------------------------------------------------
+    # 掉台回复: 黑色(台面)检测
+    # ------------------------------------------------------------------
+    def detect_black_ratio(self, frame):
+        """检测画面中黑色(台面)区域占比和中心位置。
+
+        不走 CLAHE 预处理 (CLAHE 会提亮暗区, 影响黑色检测准确性),
+        直接在原图 HSV 上检测暗色区域。使用中心 2/3 ROI 减少地面边缘干扰。
+
+        Returns:
+            (ratio, cx, cy, direction)
+            ratio: 黑色面积占比 [0.0, 1.0]
+            cx, cy: 黑色区域质心 (全分辨率坐标)
+            direction: 质心相对画面中心偏移 [-1.0, +1.0]
+        """
+        h, w = frame.shape[:2]
+        margin_x = w // 6
+        margin_y = h // 6
+        roi = frame[margin_y:h - margin_y, margin_x:w - margin_x]
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        black_mask = cv2.inRange(hsv,
+                                 config.HSV_BLACK['lower'],
+                                 config.HSV_BLACK['upper'])
+
+        # 形态学清理: 去噪点 + 填空洞
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, kernel)
+        black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, kernel)
+
+        total_pixels = roi.shape[0] * roi.shape[1]
+        black_pixels = cv2.countNonZero(black_mask)
+        ratio = black_pixels / total_pixels if total_pixels > 0 else 0.0
+
+        # 计算黑色区域质心
+        cx_full = w // 2
+        cy_full = h // 2
+        direction = 0.0
+
+        if black_pixels > 100:
+            moments = cv2.moments(black_mask)
+            if moments['m00'] > 0:
+                cx_roi = int(moments['m10'] / moments['m00'])
+                cy_roi = int(moments['m01'] / moments['m00'])
+                cx_full = cx_roi + margin_x
+                cy_full = cy_roi + margin_y
+                direction = (cx_full - w / 2) / (w / 2)
+
+        return ratio, cx_full, cy_full, direction
+
     def get_priority_target(self, friends, enemies, neutrals):
         """
         获取最优先目标 (面积最大=最近优先)

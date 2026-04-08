@@ -13,6 +13,7 @@ UART 通信模块 v3 - 自动重连 + 颜色心跳 + 炸弹类型支持
   'b' = 己方蓝色      'y' = 己方黄色
   's' = 开始识别      'p' = 暂停识别
   'c' = 收集模式      'f' = 战斗模式
+  'D' = 掉台回复模式   (视觉切换到黑色检测, 发送 G/X)
 """
 import time
 import config
@@ -31,6 +32,7 @@ class UartComm:
         self.my_color = 'b'
         self.mode = 'fight'          # 'fight'=格斗(颜色检测) / 'collect'=收集(Tag检测)
         self.active = True           # 是否激活发送
+        self.drop_recovery = False   # 掉台回复模式 (黑色检测)
         self._color_changed = False  # 颜色切换标志, 供主循环检测并切换WB
         self._last_send = 0.0
         self._send_interval = 0.050  # 最高 20Hz 发送频率
@@ -137,11 +139,15 @@ class UartComm:
                     if old != ch:
                         self._color_changed = True
                     return ch
-                if ch == 's':
+                if ch == 's' or ch == 'S':
                     self.active = True
-                    return ch
+                    self.drop_recovery = False
+                    return 's'
                 if ch == 'p':
                     self.active = False
+                    return ch
+                if ch == 'D':
+                    self.drop_recovery = True
                     return ch
                 if ch == 'c':
                     self.mode = 'collect'

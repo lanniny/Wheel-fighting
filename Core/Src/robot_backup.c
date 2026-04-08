@@ -3,6 +3,7 @@
 #include "motor.h"
 #include "obstacle.h"
 #include "shade.h"
+#include "vision_parser.h"
 
 extern float voltage[2];
 
@@ -18,6 +19,7 @@ static bool Backup_Done = false;
 
 static void Backup_FinishRecovery(uint32_t current_time)
 {
+    Vision_SendCmd('S');  /* 通知视觉: 回台成功, 恢复正常检测 */
     drive_Left_M();
     HAL_Delay(200);
     MOTOR_StopAll();
@@ -54,6 +56,7 @@ void Backup_Init(void)
     Backup_Stage = BACKUP_SPIN;
     Backup_StartTime = HAL_GetTick();
     Backup_Done = false;
+    Vision_SendCmd('D');  /* 通知视觉: 进入掉台回复, 切换黑色检测 */
 }
 
 void Backup_Update(void)
@@ -72,7 +75,9 @@ void Backup_Update(void)
     {
         case BACKUP_SPIN:
             drive_Left_L();
-            if(Backup_FrontAlignReady())
+            /* 视觉辅助对齐: 'G'=台面在正前方, 与光电条件取或 */
+            if(Backup_FrontAlignReady()
+               || (!Vision_IsTimeout() && vision_target.type == 'G'))
             {
                 Backup_SwitchStage(BACKUP_RUSH_FORWARD, current_time);
             }

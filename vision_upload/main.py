@@ -303,8 +303,13 @@ class VisionSystem:
                 # 2. 读STM32指令
                 cmd = self.comm.read_command()
                 if cmd:
-                    print(f'\n[UART] Cmd: {cmd!r} my_color={self.comm.my_color}')
-                    det_logger.info('UART_CMD %s color=%s', cmd, self.comm.my_color)
+                    extra = ''
+                    if cmd == 'D':
+                        extra = ' → DROP RECOVERY MODE'
+                    elif cmd == 's' and not self.comm.drop_recovery:
+                        extra = ' → NORMAL DETECT MODE'
+                    print(f'\n[UART] Cmd: {cmd!r} my_color={self.comm.my_color}{extra}')
+                    det_logger.info('UART_CMD %s color=%s%s', cmd, self.comm.my_color, extra)
 
                     # 颜色切换 → 动态调整白平衡
                     if getattr(self.comm, '_color_changed', False):
@@ -322,7 +327,59 @@ class VisionSystem:
                             det_logger.info('WB_SWITCH %dK color=%s',
                                             new_wb, self.comm.my_color)
 
-                # 3. 标定模式
+                # 3. 掉台回复模式: 黑色(台面)检测
+                if self.comm.drop_recovery:
+                    ratio, bcx, bcy, bdir = self.detector.detect_black_ratio(frame)
+                    t_det = time.perf_counter()
+
+                    threshold = getattr(config, 'DROP_BLACK_RATIO_THRESHOLD', 0.55)
+                    ratio_pct = int(ratio * 100)
+                    if ratio >= threshold:
+                        self.comm.send_target('G', bcx, bcy, ratio_pct, bdir)
+                    else:
+                        self.comm.send_target('X')
+                    t_uart = time.perf_counter()
+
+                    self._update_fps()
+                    frame_idx += 1
+                    dt_ms = (time.perf_counter() - t0) * 1000
+
+                    # 日志
+                    det_logger.info('DROP ratio=%d%% cx=%d dir=%+.2f %s %.0fms',
+                                    ratio_pct, bcx, bdir,
+                                    'GO!' if ratio >= threshold else 'wait',
+                                    dt_ms)
+
+                    # 终端输出
+                    if frame_idx % 10 == 0:
+                        status = 'GO!' if ratio >= threshold else 'wait'
+                        sys.stdout.write(
+                            f'\r[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
+                            f'DROP black={ratio_pct}% dir={bdir:+.2f} '
+                            f'{status}      ')
+                        sys.stdout.flush()
+
+                    # 流媒体: 标注黑色检测结果
+                    if self.stream and self._stream_server and frame_idx % 3 == 0:
+                        annotated = frame.copy()
+                        h, w = frame.shape[:2]
+                        mx, my = w // 6, h // 6
+                        color = (0, 255, 0) if ratio >= threshold else (0, 0, 255)
+                        cv2.rectangle(annotated, (mx, my), (w - mx, h - my),
+                                      color, 2)
+                        cv2.drawMarker(annotated, (bcx, bcy), color,
+                                       cv2.MARKER_CROSS, 20, 2)
+                        info = (f'DROP {ratio_pct}% dir={bdir:+.2f} '
+                                f'{"GO!" if ratio >= threshold else "wait"}')
+                        cv2.putText(annotated, info, (10, 25),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        _publish_frame(annotated)
+
+                    self._sleep_until(next_frame)
+                    next_frame += frame_dt
+                    continue
+
+                # 4. 标定模式
                 if self.calibrate:
                     self._calibrate_frame(frame)
                     if self.stream:

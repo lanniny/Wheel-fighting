@@ -188,6 +188,16 @@ void Vision_SendColor(char color)
 }
 
 /**
+ * @brief 向视觉系统发送单字节指令
+ * @param cmd 指令字符: 'D'=掉台回复模式  'S'=恢复正常检测
+ */
+void Vision_SendCmd(char cmd)
+{
+    uint8_t ch = (uint8_t)cmd;
+    HAL_UART_Transmit(&huart2, &ch, 1u, 10u);
+}
+
+/**
  * @brief 检查视觉数据是否超时
  * @return 1=超时或无数据, 0=数据新鲜
  */
