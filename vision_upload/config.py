@@ -206,7 +206,7 @@ HSV_BLACK = {
                        int(os.environ.get('VISION_BLACK_S_MAX', '100')),
                        int(os.environ.get('VISION_BLACK_V_MAX', '60'))]),
 }
-DROP_BLACK_RATIO_THRESHOLD = float(os.environ.get('VISION_DROP_BLACK_RATIO', '0.55'))
+DROP_BLACK_RATIO_THRESHOLD = float(os.environ.get('VISION_DROP_BLACK_RATIO', '0.60'))
 DROP_SEND_INTERVAL = float(os.environ.get('VISION_DROP_INTERVAL', '0.05'))  # 20Hz
 
 # ============ AprilTag 辅助检测 ============
