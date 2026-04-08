@@ -347,8 +347,12 @@ class VisionSystem:
                     # 日志
                     det_logger.info('DROP ratio=%d%% cx=%d dir=%+.2f %s %.0fms',
                                     ratio_pct, bcx, bdir,
-                                    'GO!' if ratio >= threshold else 'wait',
+                                    'GO' if ratio >= threshold else 'wait',
                                     dt_ms)
+                    if frame_idx % 30 == 0:
+                        det_logger.info('DROP_DBG Vmean=%.0f Vstd=%.0f th=%.0f%%',
+                                        self.detector._v_ema,
+                                        0.0, threshold * 100)
 
                     # 终端输出
                     if frame_idx % 10 == 0:

@@ -529,8 +529,12 @@ class ColorDetector:
     def detect_black_ratio(self, frame):
         """检测画面中黑色(台面)区域占比和中心位置。
 
-        不走 CLAHE 预处理 (CLAHE 会提亮暗区, 影响黑色检测准确性),
-        直接在原图 HSV 上检测暗色区域。使用中心 2/3 ROI 减少地面边缘干扰。
+        自适应策略: 自动曝光会把暗场景整体提亮(黑墙V≈120), 不能
+        靠V绝对值。改用三重判据:
+          1) 低饱和度 (S < S_MAX): 黑色/灰色无彩色
+          2) V 低于自适应阈值 (V < 画面V均值 * 0.85): 相对暗区
+          3) 颜色均匀性: V 通道标准差低 (均匀暗色, 非彩色物体)
+        三个条件取交集, 对抗 AE 导致的整体亮度漂移。
 
         Returns:
             (ratio, cx, cy, direction)
@@ -544,9 +548,27 @@ class ColorDetector:
         roi = frame[margin_y:h - margin_y, margin_x:w - margin_x]
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        black_mask = cv2.inRange(hsv,
-                                 config.HSV_BLACK['lower'],
-                                 config.HSV_BLACK['upper'])
+        v_ch = hsv[:, :, 2]
+        s_ch = hsv[:, :, 1]
+
+        # 自适应 V 阈值: 基于画面 V 均值动态计算
+        v_mean = float(v_ch.mean())
+        v_std = float(v_ch.std())
+        # AE 会把暗场景整体提亮(黑墙 V≈120), V 绝对值不可靠。
+        # 改用 "低于均值" 作为暗区判据: 黑色台面的 V 集中在均值以下,
+        # 正常彩色场景的暗区像素占比远低于 50%.
+        adaptive_v_max = max(
+            int(config.HSV_BLACK['upper'][2]),       # 绝对下限 (默认60)
+            int(v_mean * 1.0),                       # 均值的100% (低于均值=暗)
+        )
+        s_max = int(config.HSV_BLACK['upper'][1])    # 饱和度上限 (默认100)
+
+        # 条件1: 低饱和度 (无彩色)
+        s_mask = (s_ch <= s_max).astype(np.uint8) * 255
+        # 条件2: V 低于自适应阈值
+        v_mask = (v_ch <= adaptive_v_max).astype(np.uint8) * 255
+        # 交集
+        black_mask = cv2.bitwise_and(s_mask, v_mask)
 
         # 形态学清理: 去噪点 + 填空洞
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -556,6 +578,16 @@ class ColorDetector:
         total_pixels = roi.shape[0] * roi.shape[1]
         black_pixels = cv2.countNonZero(black_mask)
         ratio = black_pixels / total_pixels if total_pixels > 0 else 0.0
+
+        # 额外加分: 画面整体 V 标准差低 → 说明整片均匀暗色, 更可能是台面
+        # V_std<30 说明几乎全黑/全暗 → ratio 加成
+        uniformity_bonus = 0.0
+        if v_std < 30:
+            uniformity_bonus = 0.15
+        elif v_std < 40:
+            uniformity_bonus = 0.08
+
+        effective_ratio = min(1.0, ratio + uniformity_bonus)
 
         # 计算黑色区域质心
         cx_full = w // 2
@@ -571,7 +603,7 @@ class ColorDetector:
                 cy_full = cy_roi + margin_y
                 direction = (cx_full - w / 2) / (w / 2)
 
-        return ratio, cx_full, cy_full, direction
+        return effective_ratio, cx_full, cy_full, direction
 
     def get_priority_target(self, friends, enemies, neutrals):
         """
