@@ -19,6 +19,7 @@ v5 改进:
 import sys
 import os
 import time
+import signal
 import argparse
 import threading
 import logging
@@ -134,6 +135,7 @@ class Camera:
         self.cap = None
         self._reconnect_interval = 2.0
         self._last_reconnect = 0.0
+        self.on_reconnect = None  # 重连回调 (清Tracker等)
 
     def open(self):
         dev = config.CAMERA_DEVICE
@@ -167,6 +169,8 @@ class Camera:
         config.CAMERA_DEVICE = config.find_camera()
         if self.open():
             print('Camera reconnected!')
+            if self.on_reconnect:
+                self.on_reconnect()
             ret, frame = self.cap.read()
             return frame if ret else None
         return None
@@ -180,13 +184,16 @@ class Camera:
 # ============ Vision System ============
 class VisionSystem:
     def __init__(self, debug=False, calibrate=False, use_uart=True,
-                 stream=True, stream_port=8080, tag_backend=None):
+                 stream=True, stream_port=8080, tag_backend=None,
+                 handshake=True):
         self.debug = debug
         self.calibrate = calibrate
         self.use_uart = use_uart
         self.stream = stream
         self.camera = Camera()
         self.detector = ColorDetector(enable_tracking=True)
+        # 相机重连时清除 Tracker 旧轨迹 (防止幽灵目标)
+        self.camera.on_reconnect = self._on_camera_reconnect
         # Tag 检测: 显式指定后端 或 config 启用时自动创建
         if tag_backend:
             self.tag_detector = TagDetector(tag_backend)
@@ -213,6 +220,8 @@ class VisionSystem:
         self._perf_anno = 0.0
         self._perf_stream = 0.0
         self._perf_count = 0
+        # 握手控制
+        self._handshake = handshake and use_uart
         # 掉台回复迟滞状态机
         self._drop_sending_G = False    # 当前是否处于发G状态
         self._drop_confirm_count = 0    # G确认帧计数器
@@ -260,7 +269,22 @@ class VisionSystem:
         if self.stream:
             self._stream_server = _start_stream_server(self._stream_port)
 
-        print('Vision system v5 running. Ctrl+C to stop.')
+        # SIGTERM 优雅关闭 (systemd stop)
+        self._running = True
+        def _sigterm_handler(signum, frame_):
+            print('\n[SIGTERM] Shutting down...')
+            self._running = False
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+
+        # 握手阶段: 等待 STM32 颜色确认
+        if self._handshake:
+            if not self._run_handshake():
+                print('[HANDSHAKE] Aborted (signal)')
+                return
+        else:
+            print('[HANDSHAKE] Skipped (--no-handshake or --no-uart)')
+
+        print('Vision system v6 running. Ctrl+C to stop.')
         print(f'Mode    : {"calibrate" if self.calibrate else "debug" if self.debug else "normal"}')
         print(f'Color   : {self.comm.my_color}')
         print(f'UART    : {"on" if self.use_uart else "off"}')
@@ -288,7 +312,7 @@ class VisionSystem:
         next_frame = time.perf_counter()
 
         try:
-            while True:
+            while self._running:
                 t0 = time.perf_counter()
 
                 # 1. 读帧 [计时: cap]
@@ -309,46 +333,7 @@ class VisionSystem:
                 # 2. 读STM32指令
                 cmd = self.comm.read_command()
                 if cmd:
-                    extra = ''
-                    if cmd == 'N':
-                        print('\n[UART] STM32 restart detected (N), '
-                              'vision service will restart...')
-                        det_logger.info('STM32_RESTART received N, exiting for systemd restart')
-                        # 优雅退出: 关闭资源后 sys.exit, systemd Restart=always 会自动重启
-                        self.comm.close()
-                        self.camera.release()
-                        sys.exit(0)
-                    elif cmd == 'D':
-                        self._drop_start_time = time.time()
-                        self._drop_sending_G = False
-                        self._drop_confirm_count = 0
-                        self.detector.reset_drop_ema()
-                        extra = ' → DROP RECOVERY MODE'
-                    elif cmd in ('s', 'S'):
-                        self._drop_start_time = 0.0
-                        self._drop_sending_G = False
-                        self._drop_confirm_count = 0
-                        self.detector.reset_drop_ema()
-                        if not self.comm.drop_recovery:
-                            extra = ' → NORMAL DETECT MODE'
-                    print(f'\n[UART] Cmd: {cmd!r} my_color={self.comm.my_color}{extra}')
-                    det_logger.info('UART_CMD %s color=%s%s', cmd, self.comm.my_color, extra)
-
-                    # 颜色切换 → 动态调整白平衡
-                    if getattr(self.comm, '_color_changed', False):
-                        self.comm._color_changed = False
-                        new_wb = (config.WB_YELLOW
-                                  if self.comm.my_color == 'y'
-                                  else config.WB_BLUE)
-                        if new_wb != config.WB_TEMPERATURE:
-                            config.WB_TEMPERATURE = new_wb
-                            if self.camera.cap:
-                                self.camera.cap.set(
-                                    cv2.CAP_PROP_WB_TEMPERATURE, new_wb)
-                            print(f'[AUTO-WB] color={self.comm.my_color}'
-                                  f' → WB={new_wb}K')
-                            det_logger.info('WB_SWITCH %dK color=%s',
-                                            new_wb, self.comm.my_color)
+                    self._handle_command(cmd)
 
                 # 3. 掉台回复模式: 黑色(台面)检测
                 if self.comm.drop_recovery:
@@ -555,7 +540,6 @@ class VisionSystem:
 
                     if self.tag_detector is not None:
                         match_dist = getattr(config, 'TAG_ROI_MATCH_DIST', 80)
-                        from detector import TagDetector as _TD
 
                         # 定期全帧 Tag 扫描 (发现白色/中立等无色块)
                         is_tag_scan_frame = (
@@ -596,7 +580,7 @@ class VisionSystem:
                                 d = ((best_match['cx'] - pt.cx)**2
                                      + (best_match['cy'] - pt.cy)**2)**0.5
                                 if d < match_dist:
-                                    tag_type_override = _TD.classify_tag(
+                                    tag_type_override = TagDetector.classify_tag(
                                         best_match['id'], self.comm.my_color)
                                 # 孤儿Tag: 不匹配任何颜色目标的Tag
                                 # (如白色中立块, 颜色检测不到但Tag能看到)
@@ -609,7 +593,7 @@ class VisionSystem:
                                             orphan = False
                                             break
                                     if orphan:
-                                        ot = _TD.classify_tag(
+                                        ot = TagDetector.classify_tag(
                                             tg['id'], self.comm.my_color)
                                         if ot in ('E', 'N'):
                                             tag_standalone = tg
@@ -631,43 +615,19 @@ class VisionSystem:
                 # 5. 发送 [计时: uart]
                 if collect_mode:
                     if tags:
-                        from detector import TagDetector as _TD
-                        best = tags[0]
-                        t_type = _TD.classify_tag(
-                            best.get('id', 0), self.comm.my_color)
-                        direction = ((best.get('cx', 0) - config.CAMERA_WIDTH / 2)
-                                     / (config.CAMERA_WIDTH / 2))
-                        self.comm.send_target(t_type, best.get('cx', 0),
-                                              best.get('cy', 0),
-                                              best.get('area', 0), direction)
+                        self._send_tag_target(tags[0])
                     else:
                         self.comm.send_target('X')
                 elif tag_standalone and pt and tag_standalone.get('area', 0) > pt.area * 2:
                     # 孤儿Tag面积远大于颜色噪声 → Tag目标优先
-                    from detector import TagDetector as _TD
-                    t_type = _TD.classify_tag(
-                        tag_standalone['id'], self.comm.my_color)
-                    direction = ((tag_standalone['cx'] - config.CAMERA_WIDTH / 2)
-                                 / (config.CAMERA_WIDTH / 2))
-                    self.comm.send_target(t_type, tag_standalone['cx'],
-                                          tag_standalone['cy'],
-                                          tag_standalone.get('area', 0),
-                                          direction)
+                    self._send_tag_target(tag_standalone)
                 elif tag_type_override and pt:
                     # 颜色+Tag融合: Tag精确分类优先
                     self.comm.send_target(tag_type_override,
                                           pt.cx, pt.cy, pt.area, pt.direction)
                 elif tag_standalone:
                     # Tag独立发现: 颜色未命中但Tag检测到目标
-                    from detector import TagDetector as _TD
-                    t_type = _TD.classify_tag(
-                        tag_standalone['id'], self.comm.my_color)
-                    direction = ((tag_standalone['cx'] - config.CAMERA_WIDTH / 2)
-                                 / (config.CAMERA_WIDTH / 2))
-                    self.comm.send_target(t_type, tag_standalone['cx'],
-                                          tag_standalone['cy'],
-                                          tag_standalone.get('area', 0),
-                                          direction)
+                    self._send_tag_target(tag_standalone)
                 elif own_only:
                     self.comm.send_own_detection(own_targets)
                 else:
@@ -837,6 +797,142 @@ class VisionSystem:
             det_logger.info('=== Vision stopped ===')
             print('Vision system stopped.')
 
+    def _run_handshake(self):
+        """启动握手: 等待 STM32 颜色确认, 发送 H 帧直到收到 's' 启动命令。
+
+        流程:
+          1. 等待 STM32 发送颜色字节 ('b'/'y')
+          2. 设置颜色后, 以 10Hz 发送 $H,<code>,0,0,0*CS\\n
+          3. STM32 验证颜色匹配后发 's', 视觉退出握手进入检测循环
+          4. 流媒体实时显示握手状态, 便于操作员确认
+        """
+        color_received = False
+        ack_count = 0
+        handshake_start = time.time()
+
+        color_labels = {'b': 'BLUE', 'y': 'YELLOW'}
+        color_bgrs = {'b': (255, 100, 0), 'y': (0, 230, 255)}
+
+        print('=' * 55)
+        print('  HANDSHAKE: waiting for STM32 color...')
+        print(f'  Default: {color_labels.get(self.comm.my_color, "?")}')
+        print('=' * 55)
+        det_logger.info('HANDSHAKE_START default=%s', self.comm.my_color)
+
+        while self._running:
+            # 读 STM32 命令
+            cmd = self.comm.read_command()
+            if cmd in ('b', 'y'):
+                if not color_received:
+                    print(f'[HANDSHAKE] Color received: {color_labels[cmd]}')
+                    det_logger.info('HANDSHAKE_COLOR %s', cmd)
+                color_received = True
+            elif cmd == 's' and color_received:
+                # STM32 确认启动
+                elapsed = time.time() - handshake_start
+                print(f'[HANDSHAKE] OK! color={self.comm.my_color} '
+                      f'acks={ack_count} time={elapsed:.1f}s')
+                det_logger.info('HANDSHAKE_OK color=%s acks=%d time=%.1fs',
+                                self.comm.my_color, ack_count, elapsed)
+                return True
+
+            # 收到颜色后开始发握手确认帧
+            if color_received:
+                self.comm.send_handshake()
+                ack_count += 1
+
+            # 流媒体: 显示握手状态
+            if self.stream and self._stream_server:
+                frame = self.camera.read()
+                if frame is not None:
+                    annotated = frame.copy()
+                    h, w = frame.shape[:2]
+                    clr = self.comm.my_color
+                    bgr = color_bgrs.get(clr, (0, 255, 0))
+                    label = color_labels.get(clr, '?')
+                    elapsed = time.time() - handshake_start
+
+                    if color_received:
+                        cv2.putText(annotated, f'HANDSHAKE: {label}',
+                                    (w // 2 - 200, h // 2 - 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.3, bgr, 3)
+                        cv2.putText(annotated, f'Sending H frame... ACK #{ack_count}',
+                                    (w // 2 - 180, h // 2 + 20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(annotated, 'WAITING FOR STM32...',
+                                    (w // 2 - 200, h // 2 - 20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                        cv2.putText(annotated, f'Default: {label}',
+                                    (w // 2 - 80, h // 2 + 20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2)
+
+                    cv2.putText(annotated, f'{elapsed:.0f}s',
+                                (10, h - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    _publish_frame(annotated)
+
+            time.sleep(0.05)
+
+        return False  # SIGTERM
+
+    def _on_camera_reconnect(self):
+        """相机重连回调: 清除 Tracker 旧轨迹 + 重置 EMA"""
+        if self.detector._tracker:
+            self.detector._tracker._tracks.clear()
+            self.detector._tracker._next_id = 0
+        self.detector._last_max_area = 0
+        self.detector._last_bboxes = []
+        print('[CAMERA] Tracker state cleared after reconnect')
+
+    def _send_tag_target(self, tag):
+        """将 Tag 检测结果分类并发送给 STM32 (消除重复的 classify+direction+send 模式)"""
+        t_type = TagDetector.classify_tag(tag['id'], self.comm.my_color)
+        direction = (tag['cx'] - config.CAMERA_WIDTH / 2) / (config.CAMERA_WIDTH / 2)
+        self.comm.send_target(t_type, tag['cx'], tag['cy'],
+                              tag.get('area', 0), direction)
+        return t_type
+
+    def _handle_command(self, cmd):
+        """处理 STM32 单字节指令, 返回日志后缀字符串"""
+        extra = ''
+        if cmd == 'N':
+            self._drop_start_time = 0.0
+            self._drop_sending_G = False
+            self._drop_confirm_count = 0
+            self.detector.reset_drop_ema()
+            self.comm.active = True
+            self.comm.drop_recovery = False
+            extra = ' → RESET TO NORMAL DETECT'
+        elif cmd == 'D':
+            self._drop_start_time = time.time()
+            self._drop_sending_G = False
+            self._drop_confirm_count = 0
+            self.detector.reset_drop_ema()
+            extra = ' → DROP RECOVERY MODE'
+        elif cmd in ('s', 'S'):
+            self._drop_start_time = 0.0
+            self._drop_sending_G = False
+            self._drop_confirm_count = 0
+            self.detector.reset_drop_ema()
+            if not self.comm.drop_recovery:
+                extra = ' → NORMAL DETECT MODE'
+
+        print(f'\n[UART] Cmd: {cmd!r} my_color={self.comm.my_color}{extra}')
+        det_logger.info('UART_CMD %s color=%s%s', cmd, self.comm.my_color, extra)
+
+        # 颜色切换 → 动态调整白平衡
+        if getattr(self.comm, '_color_changed', False):
+            self.comm._color_changed = False
+            new_wb = (config.WB_YELLOW if self.comm.my_color == 'y'
+                      else config.WB_BLUE)
+            if new_wb != config.WB_TEMPERATURE:
+                config.WB_TEMPERATURE = new_wb
+                if self.camera.cap:
+                    self.camera.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, new_wb)
+                print(f'[AUTO-WB] color={self.comm.my_color} → WB={new_wb}K')
+                det_logger.info('WB_SWITCH %dK color=%s', new_wb, self.comm.my_color)
+
     def _draw_echo_status(self, frame):
         """在画面底部绘制 STM32 回声确认状态栏。
 
@@ -907,6 +1003,8 @@ def main():
     parser.add_argument('--color', choices=['b', 'y'], default='b')
     parser.add_argument('--priority-mode', choices=['collect', 'attack'],
                         default=None)
+    parser.add_argument('--no-handshake', action='store_true',
+                        help='Skip STM32 color handshake')
     parser.add_argument('--no-stream', action='store_true',
                         help='Disable MJPEG stream server')
     parser.add_argument('--stream-port', type=int, default=8080,
@@ -935,6 +1033,7 @@ def main():
         stream=not args.no_stream,
         stream_port=args.stream_port,
         tag_backend=args.tag_backend,
+        handshake=not args.no_handshake,
     )
     vision.comm.my_color = args.color
     vision.comm.mode = args.mode

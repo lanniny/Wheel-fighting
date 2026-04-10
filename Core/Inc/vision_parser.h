@@ -37,6 +37,16 @@ void Vision_SendColor(char color);
 void Vision_SendCmd(char cmd);
 
 /**
+ * @brief 等待视觉系统握手确认
+ *        周期性发送颜色字节, 等待视觉回传 $H,<color_code>,0,0,0*CS\n
+ *        颜色匹配后发送 's' 启动视觉检测
+ * @param team  当前队伍颜色 (需 #include "robot_up.h")
+ * @param timeout_ms  最大等待时间(ms), 超时则强制继续
+ * @return 1=握手成功, 0=超时
+ */
+uint8_t Vision_WaitHandshake(uint8_t team_is_blue, uint32_t timeout_ms);
+
+/**
  * @brief 检查视觉数据是否超时 (200ms无新数据视为超时)
  * @return 1=超时/无数据, 0=数据有效
  */

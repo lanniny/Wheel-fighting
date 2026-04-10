@@ -198,6 +198,57 @@ void Vision_SendCmd(char cmd)
 }
 
 /**
+ * @brief 等待视觉系统握手确认
+ *
+ * 流程: 每200ms发送颜色 → 等待视觉回传 $H,<code>,0,0,0*CS → 匹配后发 's'
+ *   code: 1=蓝方, 2=黄方
+ *
+ * @param team_is_blue  1=蓝方, 0=黄方
+ * @param timeout_ms    最大等待时间(ms), 超时返回0
+ * @return 1=握手成功, 0=超时
+ */
+uint8_t Vision_WaitHandshake(uint8_t team_is_blue, uint32_t timeout_ms)
+{
+    char color_byte   = team_is_blue ? 'b' : 'y';
+    int16_t expect_cx = team_is_blue ? 1 : 2;   /* H帧的cx字段: 1=蓝, 2=黄 */
+
+    uint32_t start     = HAL_GetTick();
+    uint32_t last_send = 0u;
+
+    while ((HAL_GetTick() - start) < timeout_ms)
+    {
+        /* 每200ms重发颜色字节, 确保视觉系统能收到 */
+        uint32_t now = HAL_GetTick();
+        if ((now - last_send) >= 200u)
+        {
+            Vision_SendColor(color_byte);
+            last_send = now;
+        }
+
+        /* 检查是否收到匹配的 H 帧 (DMA中断已在 parse_frame 中写入 vision_target) */
+        if (vision_target.type == 'H' && vision_target.cx == expect_cx)
+        {
+            /* 握手成功: 发送 's' 启动视觉检测 (发两次防丢) */
+            Vision_SendCmd('s');
+            HAL_Delay(30);
+            Vision_SendCmd('s');
+
+            /* 清除握手帧, 防止主循环误读 */
+            vision_target.type  = 'X';
+            vision_target.valid = 0u;
+            vision_target.cx    = 0;
+            return 1u;
+        }
+
+        HAL_Delay(10);
+    }
+
+    /* 超时: 强制发 's' 让视觉继续, 机器人仍可依赖红外 */
+    Vision_SendCmd('s');
+    return 0u;
+}
+
+/**
  * @brief 检查视觉数据是否超时
  * @return 1=超时或无数据, 0=数据新鲜
  */

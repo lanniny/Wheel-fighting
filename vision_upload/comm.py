@@ -2,12 +2,13 @@
 UART 通信模块 v3 - 自动重连 + 颜色心跳 + 炸弹类型支持
 
 协议 (LubanCat -> STM32):  $type,cx,cy,area,dir*CS\n
-  type: E=敌方  N=中立  F=友方  X=无目标  B=炸弹
+  type: E=敌方  N=中立  F=友方  X=无目标  B=炸弹  H=握手确认
   cx,cy: 目标中心像素坐标 [0-640 / 0-480]
   area:  目标面积 (像素)
   dir:   方向偏移整数 [-100,+100]  负=左 正=右
   CS:    body 字段的逐字节异或校验和 (十六进制 2位)
   例:   $E,320,240,5000,+25*4A\n
+  握手: $H,1,0,0,0*CS\n  (cx=1蓝方, cx=2黄方)
 
 协议 (STM32 -> LubanCat): 单字节指令
   'b' = 己方蓝色      'y' = 己方黄色
@@ -15,7 +16,7 @@ UART 通信模块 v3 - 自动重连 + 颜色心跳 + 炸弹类型支持
   'c' = 收集模式      'f' = 战斗模式 (预留, STM32未实现)
   'D' = 掉台回复模式   (视觉切换到黑色检测, 发送 G/X)
   'S' = 恢复正常检测   (掉台回复完成, 切回颜色检测)
-  'N' = STM32正常重启  (视觉服务跟随重启, systemd自动拉起)
+  'N' = STM32正常重启  (视觉重置为正常识别状态)
 """
 import os
 import time
@@ -422,16 +423,32 @@ class UartComm:
             self._stats_timer = now
 
     # ------------------------------------------------------------------
-    # 颜色心跳 (已废弃)
+    # 握手确认
     # ------------------------------------------------------------------
-    def send_color_heartbeat(self):
+    def send_handshake(self):
+        """发送握手确认帧 $H,<color_code>,0,0,0*CS\\n (绕过活跃状态和频率限制)。
+        color_code: 1=蓝方, 2=黄方。STM32 收到后校验颜色, 匹配则发 's' 启动。
         """
-        [已废弃] 原设计定期向 STM32 重发己方颜色字符。
-        但实际协议中颜色由 STM32 通过 Vision_SendColor() 下发给上位机，
-        STM32 的 vision_parser 仅解析 $...*CS 格式帧，单字节颜色会被忽略。
-        保留方法签名以兼容调用方，但不再执行任何操作。
-        """
-        pass
+        if not self.ser:
+            self._try_reconnect()
+            return
+        now = time.time()
+        if now - self._last_send < 0.1:  # 10Hz
+            return
+        if not self._check_device_alive():
+            self._try_reconnect()
+            return
+        try:
+            color_code = 1 if self.my_color == 'b' else 2
+            body = f'H,{color_code},0,0,0'
+            cs = self._checksum(body)
+            msg = f'${body}*{cs}\n'
+            self.ser.write(msg.encode())
+            self._last_send = now
+        except Exception:
+            self._tx_errors += 1
+            if self._tx_errors >= self._TX_ERROR_THRESHOLD:
+                self._try_reconnect()
 
     # ------------------------------------------------------------------
     # 高层接口
