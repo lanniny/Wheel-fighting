@@ -11,9 +11,11 @@ UART 通信模块 v3 - 自动重连 + 颜色心跳 + 炸弹类型支持
 
 协议 (STM32 -> LubanCat): 单字节指令
   'b' = 己方蓝色      'y' = 己方黄色
-  's' = 开始识别      'p' = 暂停识别
-  'c' = 收集模式      'f' = 战斗模式
+  's' = 开始识别      'p' = 暂停识别 (预留, STM32未实现)
+  'c' = 收集模式      'f' = 战斗模式 (预留, STM32未实现)
   'D' = 掉台回复模式   (视觉切换到黑色检测, 发送 G/X)
+  'S' = 恢复正常检测   (掉台回复完成, 切回颜色检测)
+  'N' = STM32正常重启  (视觉服务跟随重启, systemd自动拉起)
 """
 import os
 import time
@@ -187,6 +189,9 @@ class UartComm:
             return ch
         if ch == 'f':
             self.mode = 'fight'
+            return ch
+        if ch == 'N':
+            # STM32 正常重启标志, 视觉需跟随重启
             return ch
         return None
 
@@ -378,7 +383,7 @@ class UartComm:
 
         self._tx_total += 1
         try:
-            dir_int = max(-100, min(100, int(direction * 100)))
+            dir_int = max(-100, min(100, round(direction * 100)))
             if target_type == 'X':
                 body = 'X,0,0,0,0'
             else:
@@ -431,19 +436,16 @@ class UartComm:
     # ------------------------------------------------------------------
     # 高层接口
     # ------------------------------------------------------------------
-    def send_tag(self, tag):
+    def send_tag(self, tag, my_color='b'):
         """
-        发送 Tag 检测结果给 STM32。
+        发送 Tag 检测结果给 STM32 (标准5字段帧)。
         tag: {'id': int|str, 'cx': int, 'cy': int, 'area': int}
-        协议: $T,tag_id,cx,cy,area,dir*CS\n
+
+        旧方案 $T,tag_id,cx,cy,area,dir*CS\\n 有6字段,
+        STM32 sscanf 只解析5字段 → 帧被丢弃 (CRITICAL BUG)。
+        修复: 将 tag_id 翻译为标准类型 E/N/F, 用 send_target() 发送。
         """
         if not self.active:
-            return
-        now = time.time()
-        if now - self._last_send < self._send_interval:
-            return
-        if not self.ser:
-            self._try_reconnect()
             return
 
         cx = tag.get('cx', 0)
@@ -457,21 +459,10 @@ class UartComm:
             print(f'[UART] Drop invalid tag id: {tag_id_raw!r}')
             return
 
-        self._tx_total += 1
-        try:
-            dir_int = max(-100, min(100, int(direction * 100)))
-            body = f'T,{tag_id},{cx},{cy},{int(area)},{dir_int:+d}'
-            cs = self._checksum(body)
-            msg = f'${body}*{cs}\n'
-            self.ser.write(msg.encode())
-            self._last_send = now
-            self._tx_errors = 0
-            self._tx_success += 1
-        except Exception as e:
-            self._tx_errors += 1
-            if self._tx_errors >= self._TX_ERROR_THRESHOLD:
-                print(f'[UART] TX error #{self._tx_errors}: {e}, reconnecting')
-                self._try_reconnect()
+        # Tag ID → 标准类型: 兼容 STM32 的 5字段解析器
+        from detector import TagDetector
+        t_type = TagDetector.classify_tag(tag_id, my_color)
+        self.send_target(t_type, cx, cy, area, direction)
 
     def send_own_detection(self, own_targets):
         """

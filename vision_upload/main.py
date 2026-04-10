@@ -213,6 +213,10 @@ class VisionSystem:
         self._perf_anno = 0.0
         self._perf_stream = 0.0
         self._perf_count = 0
+        # 掉台回复迟滞状态机
+        self._drop_sending_G = False    # 当前是否处于发G状态
+        self._drop_confirm_count = 0    # G确认帧计数器
+        self._drop_start_time = 0.0     # 掉台开始时间
 
     def _update_fps(self):
         self._frame_count += 1
@@ -245,11 +249,13 @@ class VisionSystem:
         self._debug_thread.start()
 
     def run(self):
-        if not self.camera.open():
-            print('Waiting for camera...')
-
+        # 启动顺序优化: UART 先连接 (让 STM32 尽早收到数据),
+        # 相机初始化较慢, 放在 UART 之后
         if self.use_uart:
             self.comm.open()
+
+        if not self.camera.open():
+            print('Waiting for camera...')
 
         if self.stream:
             self._stream_server = _start_stream_server(self._stream_port)
@@ -304,13 +310,24 @@ class VisionSystem:
                 cmd = self.comm.read_command()
                 if cmd:
                     extra = ''
-                    if cmd == 'D':
+                    if cmd == 'N':
+                        print('\n[UART] STM32 restart detected (N), '
+                              'vision service will restart...')
+                        det_logger.info('STM32_RESTART received N, exiting for systemd restart')
+                        # 优雅退出: 关闭资源后 sys.exit, systemd Restart=always 会自动重启
+                        self.comm.close()
+                        self.camera.release()
+                        sys.exit(0)
+                    elif cmd == 'D':
                         self._drop_start_time = time.time()
+                        self._drop_sending_G = False
+                        self._drop_confirm_count = 0
                         self.detector.reset_drop_ema()
                         extra = ' → DROP RECOVERY MODE'
                     elif cmd in ('s', 'S'):
-                        if hasattr(self, '_drop_start_time'):
-                            del self._drop_start_time
+                        self._drop_start_time = 0.0
+                        self._drop_sending_G = False
+                        self._drop_confirm_count = 0
                         self.detector.reset_drop_ema()
                         if not self.comm.drop_recovery:
                             extra = ' → NORMAL DETECT MODE'
@@ -336,17 +353,20 @@ class VisionSystem:
                 # 3. 掉台回复模式: 黑色(台面)检测
                 if self.comm.drop_recovery:
                     # 超时保护: 防止永久卡在掉台回复模式
-                    drop_timeout = getattr(config, 'DROP_RECOVERY_TIMEOUT', 15.0)
-                    if not hasattr(self, '_drop_start_time'):
+                    drop_timeout = getattr(config, 'DROP_RECOVERY_TIMEOUT', 25.0)
+                    if self._drop_start_time <= 0:
                         self._drop_start_time = time.time()
                     drop_elapsed = time.time() - self._drop_start_time
 
                     if drop_elapsed >= drop_timeout:
-                        det_logger.info('DROP_TIMEOUT %.1fs elapsed, auto-exit', drop_elapsed)
-                        print(f'\n[DROP] Timeout {drop_elapsed:.1f}s, auto-exit to normal mode')
-                        self.comm.drop_recovery = False
-                        del self._drop_start_time
-                        self.detector.reset_drop_ema()
+                        det_logger.info('DROP_TIMEOUT %.1fs elapsed, keep sending X until STM32 sends S', drop_elapsed)
+                        print(f'\n[DROP] Timeout {drop_elapsed:.1f}s, keep X (wait for S)')
+                        # 不退出 drop_recovery! 持续发 X 直到 STM32 发 'S'
+                        # 否则视觉切回正常模式发 E/N/F 会污染 Backup 类型消抖
+                        self._drop_sending_G = False
+                        self._drop_confirm_count = 0
+                        self.comm._last_send = 0.0
+                        self.comm.send_target('X')
                         self._sleep_until(next_frame)
                         next_frame += frame_dt
                         continue
@@ -354,11 +374,35 @@ class VisionSystem:
                     ratio, bcx, bcy, bdir, dbg = self.detector.detect_black_ratio(frame)
                     t_det = time.perf_counter()
 
-                    threshold = getattr(config, 'DROP_BLACK_RATIO_THRESHOLD', 0.50)
+                    # 迟滞 + 确认帧机制:
+                    #  - 未发G: ratio 连续 N帧 > HIGH → 开始发G
+                    #  - 已发G: ratio < LOW → 停止发G (立即, 不需确认)
+                    th_high = getattr(config, 'DROP_BLACK_RATIO_HIGH', 0.50)
+                    th_low = getattr(config, 'DROP_BLACK_RATIO_LOW', 0.30)
+                    confirm_n = getattr(config, 'DROP_G_CONFIRM_FRAMES', 3)
+
+                    if self._drop_sending_G:
+                        # 已在发G: 低于下限则立即退出
+                        if ratio < th_low:
+                            self._drop_sending_G = False
+                            self._drop_confirm_count = 0
+                    else:
+                        # 未发G: 需连续N帧超上限
+                        if ratio >= th_high:
+                            self._drop_confirm_count += 1
+                            if self._drop_confirm_count >= confirm_n:
+                                self._drop_sending_G = True
+                        else:
+                            self._drop_confirm_count = 0
+
                     ratio_pct = int(ratio * 100)
-                    if ratio >= threshold:
+                    if self._drop_sending_G:
                         self.comm.send_target('G', bcx, bcy, ratio_pct, bdir)
                     else:
+                        # CRITICAL: 掉台等G阶段发X必须≥20Hz(50ms),
+                        # 否则默认5Hz(200ms)触及STM32的200ms超时,
+                        # 导致Vision_IsTimeout()=1, Backup无法用视觉辅助冲台
+                        self.comm._last_send = 0.0  # 强制本次立即发送
                         self.comm.send_target('X')
                     t_uart = time.perf_counter()
 
@@ -371,61 +415,85 @@ class VisionSystem:
                     echo_lag = self.comm._echo_latency
 
                     # 日志
-                    det_logger.info('DROP ratio=%d%% blob=%d%% cx=%d dir=%+.2f %s echo=%s %.0fms',
-                                    ratio_pct,
-                                    int(dbg['blob_ratio'] * 100),
-                                    bcx, bdir,
-                                    'GO' if ratio >= threshold else 'wait',
-                                    f'{self.comm.echo_type}' if echo_ok else '-',
-                                    dt_ms)
+                    g_status = 'G' if self._drop_sending_G else 'X'
+                    det_logger.info(
+                        'DROP send=%s ratio=%d%% blob=%d%% cx=%d dir=%+.2f '
+                        'cfm=%d/%d echo=%s %.0fms',
+                        g_status, ratio_pct,
+                        int(dbg['blob_ratio'] * 100),
+                        bcx, bdir,
+                        self._drop_confirm_count, confirm_n,
+                        f'{self.comm.echo_type}' if echo_ok else '-',
+                        dt_ms)
                     if frame_idx % 30 == 0:
                         det_logger.info(
                             'DROP_DBG Vmean=%.0f Vstd=%.1f Sstd=%.1f '
                             'Vp25=%.0f Vth=%d raw=%d%% blob=%d%% '
-                            'bonus=%.0f%% inst=%d%% th=%d%% '
-                            'echo=%d lag=%.0fms timeout=%.0f/%.0fs',
+                            'bonus=%.0f%% inst=%d%% thH=%d%% thL=%d%% '
+                            'hyst=%s echo=%d lag=%.0fms t=%.0f/%.0fs',
                             dbg['v_mean'], dbg['v_std'], dbg['s_std'],
                             dbg['v_p25'], dbg['v_th'],
                             int(dbg['raw_ratio'] * 100),
                             int(dbg['blob_ratio'] * 100),
                             dbg['bonus'] * 100,
                             int(dbg.get('instant_ratio', ratio) * 100),
-                            int(threshold * 100),
+                            int(th_high * 100), int(th_low * 100),
+                            g_status,
                             self.comm._echo_count, echo_lag,
                             drop_elapsed, drop_timeout)
 
                     # 终端输出
                     if frame_idx % 10 == 0:
-                        status = 'GO!' if ratio >= threshold else 'wait'
+                        status = f'GO[{g_status}]' if self._drop_sending_G else 'wait'
                         echo_str = (f'E:{self.comm.echo_type} {echo_lag:.0f}ms'
                                     if echo_ok else 'E:--')
                         if not self.comm.echo_healthy and self.comm._echo_count > 0:
                             echo_str = 'E:LOST!'
                         sys.stdout.write(
                             f'\r[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
-                            f'DROP {ratio_pct}% blob={int(dbg["blob_ratio"]*100)}% '
+                            f'DROP {ratio_pct}% '
+                            f'cfm={self._drop_confirm_count}/{confirm_n} '
                             f'dir={bdir:+.2f} {status} {echo_str} '
                             f'[{drop_elapsed:.0f}/{drop_timeout:.0f}s]      ')
                         sys.stdout.flush()
 
-                    # 流媒体: 标注黑色检测结果
+                    # 流媒体: 标注黑色检测结果 (含迟滞状态)
                     if self.stream and self._stream_server and frame_idx % 3 == 0:
                         annotated = frame.copy()
                         h, w = frame.shape[:2]
                         mx, my = w // 6, h // 6
-                        color = (0, 255, 0) if ratio >= threshold else (0, 0, 255)
+                        color = (0, 255, 0) if self._drop_sending_G else (0, 0, 255)
                         cv2.rectangle(annotated, (mx, my), (w - mx, h - my),
                                       color, 2)
                         cv2.drawMarker(annotated, (bcx, bcy), color,
                                        cv2.MARKER_CROSS, 20, 2)
                         echo_tag = ('ACK' if echo_ok else
                                     'LOST' if not self.comm.echo_healthy else '...')
+                        # 迟滞状态可视化
+                        hyst_str = (f'SEND G cfm={self._drop_confirm_count}'
+                                    if self._drop_sending_G
+                                    else f'WAIT cfm={self._drop_confirm_count}/{confirm_n}')
                         info = (f'DROP {ratio_pct}% blob={int(dbg["blob_ratio"]*100)}% '
-                                f'dir={bdir:+.2f} '
-                                f'{"GO!" if ratio >= threshold else "wait"} '
+                                f'dir={bdir:+.2f} {hyst_str} '
                                 f'E:{echo_tag} [{drop_elapsed:.0f}s]')
                         cv2.putText(annotated, info, (10, 25),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2)
+                        # 迟滞阈值条 (画面底部)
+                        bar_w = w - 2 * mx
+                        bar_y = h - my - 40
+                        cv2.rectangle(annotated, (mx, bar_y), (mx + bar_w, bar_y + 12),
+                                      (50, 50, 50), -1)
+                        # 低阈值标线
+                        low_x = mx + int(bar_w * th_low)
+                        cv2.line(annotated, (low_x, bar_y), (low_x, bar_y + 12),
+                                 (0, 200, 255), 2)
+                        # 高阈值标线
+                        high_x = mx + int(bar_w * th_high)
+                        cv2.line(annotated, (high_x, bar_y), (high_x, bar_y + 12),
+                                 (0, 255, 0), 2)
+                        # 当前ratio指示
+                        cur_x = mx + int(bar_w * min(1.0, ratio))
+                        cv2.circle(annotated, (cur_x, bar_y + 6), 5, color, -1)
                         # 回声确认状态栏
                         annotated = self._draw_echo_status(annotated)
                         _publish_frame(annotated)
@@ -451,6 +519,7 @@ class VisionSystem:
                 friends, enemies, neutrals = [], [], []
                 pt = None
                 tag_type_override = None  # Tag 覆盖颜色分类
+                tag_standalone = None     # Tag 独立发现 (颜色未命中)
 
                 collect_mode = (
                     self.tag_detector is not None
@@ -468,7 +537,9 @@ class VisionSystem:
                     else:
                         tags = self._last_tags
                 else:
-                    # 格斗模式: 颜色检测(每帧) + Tag 辅助(降频)
+                    # ── 格斗模式: 颜色+Tag 融合 ("任一命中即生效") ──
+                    tag_standalone = None  # Tag独立目标 (颜色未命中时)
+
                     if own_only:
                         own_targets = self.detector.detect_own(
                             frame, self.comm.my_color)
@@ -482,31 +553,84 @@ class VisionSystem:
                         _, pt = self.detector.get_priority_target(
                             friends, enemies, neutrals)
 
-                    # Tag 辅助检测: 每 N 帧做一次, 用 Tag ID 覆盖颜色分类
-                    if (self.tag_detector is not None
-                            and frame_idx % self._tag_interval == 0):
-                        tags = self.tag_detector.detect_tags(frame)
-                        self._last_tags = tags
-                    else:
-                        tags = self._last_tags
-
-                    # Tag→类型覆盖: 匹配最近的颜色目标
-                    if tags and pt:
+                    if self.tag_detector is not None:
+                        match_dist = getattr(config, 'TAG_ROI_MATCH_DIST', 80)
                         from detector import TagDetector as _TD
-                        best_tag = tags[0]
-                        tag_cx = best_tag.get('cx', 0)
-                        tag_cy = best_tag.get('cy', 0)
-                        dist = ((tag_cx - pt.cx)**2 + (tag_cy - pt.cy)**2)**0.5
-                        if dist < 80:
-                            tag_type_override = _TD.classify_tag(
-                                best_tag.get('id', 0), self.comm.my_color)
+
+                        # 定期全帧 Tag 扫描 (发现白色/中立等无色块)
+                        is_tag_scan_frame = (
+                            frame_idx % self._tag_interval == 0)
+
+                        if targets and pt:
+                            # 策略A: 有优先颜色目标 → ROI Tag精确分类
+                            top_targets = sorted(
+                                targets, key=lambda t: t.area,
+                                reverse=True)[:2]
+                            roi_tags = self.tag_detector.detect_tags_in_rois(
+                                frame, top_targets)
+                            # 补充: 全帧扫描发现ROI外的Tag (如白色中立块)
+                            if is_tag_scan_frame:
+                                full_tags = self.tag_detector.detect_tags(frame)
+                                roi_ids = {t.get('id') for t in roi_tags}
+                                for ft in full_tags:
+                                    if ft.get('id') not in roi_ids:
+                                        roi_tags.append(ft)
+                                tags = roi_tags
+                                self._last_tags = tags
+                            elif roi_tags:
+                                # ROI有结果: 合并到缓存
+                                tags = roi_tags + [
+                                    t for t in self._last_tags
+                                    if t.get('id') not in
+                                       {r.get('id') for r in roi_tags}]
+                                self._last_tags = tags
+                            else:
+                                # ROI无结果: 保留上次缓存
+                                tags = self._last_tags
+                            # 匹配: 为优先目标和孤儿Tag分别处理
+                            if tags:
+                                best_match = min(
+                                    tags,
+                                    key=lambda tg: ((tg['cx'] - pt.cx)**2
+                                                    + (tg['cy'] - pt.cy)**2))
+                                d = ((best_match['cx'] - pt.cx)**2
+                                     + (best_match['cy'] - pt.cy)**2)**0.5
+                                if d < match_dist:
+                                    tag_type_override = _TD.classify_tag(
+                                        best_match['id'], self.comm.my_color)
+                                # 孤儿Tag: 不匹配任何颜色目标的Tag
+                                # (如白色中立块, 颜色检测不到但Tag能看到)
+                                for tg in tags:
+                                    orphan = True
+                                    for ct in targets:
+                                        od = ((tg['cx'] - ct.cx)**2
+                                              + (tg['cy'] - ct.cy)**2)**0.5
+                                        if od < match_dist:
+                                            orphan = False
+                                            break
+                                    if orphan:
+                                        ot = _TD.classify_tag(
+                                            tg['id'], self.comm.my_color)
+                                        if ot in ('E', 'N'):
+                                            tag_standalone = tg
+                                            break  # 取第一个孤儿E/N
+                        else:
+                            # 策略B: 无优先颜色目标 → 全帧Tag发现
+                            if is_tag_scan_frame:
+                                tags = self.tag_detector.detect_tags(frame)
+                                self._last_tags = tags
+                            else:
+                                tags = self._last_tags
+                            # Tag独立发现目标 (白色/中立块等)
+                            if tags:
+                                best = max(tags, key=lambda t: t.get('area', 0))
+                                tag_standalone = best
 
                 t_det = time.perf_counter()
 
                 # 5. 发送 [计时: uart]
                 if collect_mode:
                     if tags:
-                        # 收集模式: Tag 结果转为类型发送
                         from detector import TagDetector as _TD
                         best = tags[0]
                         t_type = _TD.classify_tag(
@@ -518,10 +642,32 @@ class VisionSystem:
                                               best.get('area', 0), direction)
                     else:
                         self.comm.send_target('X')
+                elif tag_standalone and pt and tag_standalone.get('area', 0) > pt.area * 2:
+                    # 孤儿Tag面积远大于颜色噪声 → Tag目标优先
+                    from detector import TagDetector as _TD
+                    t_type = _TD.classify_tag(
+                        tag_standalone['id'], self.comm.my_color)
+                    direction = ((tag_standalone['cx'] - config.CAMERA_WIDTH / 2)
+                                 / (config.CAMERA_WIDTH / 2))
+                    self.comm.send_target(t_type, tag_standalone['cx'],
+                                          tag_standalone['cy'],
+                                          tag_standalone.get('area', 0),
+                                          direction)
                 elif tag_type_override and pt:
-                    # Tag 覆盖: 用精确类型发送
+                    # 颜色+Tag融合: Tag精确分类优先
                     self.comm.send_target(tag_type_override,
                                           pt.cx, pt.cy, pt.area, pt.direction)
+                elif tag_standalone:
+                    # Tag独立发现: 颜色未命中但Tag检测到目标
+                    from detector import TagDetector as _TD
+                    t_type = _TD.classify_tag(
+                        tag_standalone['id'], self.comm.my_color)
+                    direction = ((tag_standalone['cx'] - config.CAMERA_WIDTH / 2)
+                                 / (config.CAMERA_WIDTH / 2))
+                    self.comm.send_target(t_type, tag_standalone['cx'],
+                                          tag_standalone['cy'],
+                                          tag_standalone.get('area', 0),
+                                          direction)
                 elif own_only:
                     self.comm.send_own_detection(own_targets)
                 else:
@@ -546,19 +692,28 @@ class VisionSystem:
                     elif frame_idx % 30 == 0:
                         det_logger.info('OWN X (no target)')
                 else:
+                    tag_info = ''
+                    if tag_type_override:
+                        tag_info = f' tag={tag_type_override}'
+                    elif tag_standalone:
+                        tag_info = f' tag_only=id{tag_standalone["id"]}'
                     if pt:
                         det_logger.info(
                             'DET cx=%d cy=%d area=%d dir=%+.2f '
-                            'E=%d N=%d F=%d %.0fms',
+                            'E=%d N=%d F=%d%s %.0fms',
                             pt.cx, pt.cy, int(pt.area), pt.direction,
                             len(enemies), len(neutrals), len(friends),
+                            tag_info, dt_ms)
+                    elif tag_standalone:
+                        det_logger.info(
+                            'TAG_ONLY id=%s cx=%d cy=%d area=%d %.0fms',
+                            tag_standalone['id'], tag_standalone['cx'],
+                            tag_standalone['cy'], tag_standalone.get('area', 0),
                             dt_ms)
                     elif frame_idx % 30 == 0:
-                        det_logger.info('DET X E=%d N=%d F=%d',
+                        det_logger.info('DET X E=%d N=%d F=%d tags=%d',
                                         len(enemies), len(neutrals),
-                                        len(friends))
-                if tags:
-                    det_logger.info('TAG %s', tags)
+                                        len(friends), len(tags))
 
                 # 8. 终端状态输出
                 if frame_idx % 15 == 0:
@@ -574,11 +729,16 @@ class VisionSystem:
                             f'UART:{uart_s} TX:{self._tx_count} '
                             f'OWN:{n_own}{pstr}      ')
                     else:
+                        tag_s = ''
+                        if tag_type_override:
+                            tag_s = f' T:{tag_type_override}'
+                        elif tag_standalone:
+                            tag_s = f' T:id{tag_standalone["id"]}'
                         sys.stdout.write(
                             f'\r[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
                             f'UART:{uart_s} TX:{self._tx_count} '
                             f'E:{len(enemies)} N:{len(neutrals)} '
-                            f'F:{len(friends)}      ')
+                            f'F:{len(friends)}{tag_s}      ')
                     sys.stdout.flush()
 
                 # 9. 流媒体 [计时: anno + stream]
@@ -593,13 +753,41 @@ class VisionSystem:
                     else:
                         annotated = self.detector.draw_targets(
                             frame.copy(), targets, self.comm.my_color)
+                        tag_str = ''
+                        if tag_type_override:
+                            tag_str = f' TAG:{tag_type_override}'
+                        elif tag_standalone:
+                            tag_str = f' TAG_ONLY:id{tag_standalone["id"]}'
                         info = (f'FPS:{self._fps:.0f} {dt_ms:.0f}ms '
                                 f'MY:{self.comm.my_color} '
                                 f'E:{len(enemies)} N:{len(neutrals)} '
-                                f'F:{len(friends)}')
+                                f'F:{len(friends)}{tag_str}')
                     cv2.putText(annotated, info, (10, 25),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 (0, 255, 0), 2)
+                    # Tag 标注: 在画面上画 Tag 检测框和 ID (青色, 粗线)
+                    for tg in tags:
+                        tcx, tcy = tg.get('cx', 0), tg.get('cy', 0)
+                        ta = tg.get('area', 0)
+                        ts = max(15, int(ta**0.5) // 2)
+                        cv2.rectangle(annotated,
+                                      (tcx - ts, tcy - ts),
+                                      (tcx + ts, tcy + ts),
+                                      (255, 255, 0), 3)
+                        cv2.putText(annotated,
+                                    f'TAG:{tg.get("id", "?")}',
+                                    (tcx - ts, tcy - ts - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                    (255, 255, 0), 2)
+                    # Tag独立目标: 画十字 + 引导箭头 (青色)
+                    if tag_standalone:
+                        sx, sy = tag_standalone['cx'], tag_standalone['cy']
+                        cv2.drawMarker(annotated, (sx, sy),
+                                       (255, 255, 0), cv2.MARKER_TILTED_CROSS, 24, 3)
+                        fcx = config.CAMERA_WIDTH // 2
+                        fcy = config.CAMERA_HEIGHT // 2
+                        cv2.arrowedLine(annotated, (fcx, fcy), (sx, sy),
+                                        (255, 255, 0), 2, tipLength=0.05)
                     # 回声确认状态栏 (第二行)
                     annotated = self._draw_echo_status(annotated)
                     t_anno_end = time.perf_counter()

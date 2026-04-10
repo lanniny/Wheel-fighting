@@ -115,16 +115,16 @@ HSV_WHITE = {
 
 # ============ 检测参数 ============
 MIN_CONTOUR_AREA = 600
-MIN_CONTOUR_AREA_YELLOW = int(os.environ.get('VISION_YELLOW_MIN_AREA', '1500'))  # 与蓝色同量级, 远距离可检测
-MAX_CONTOUR_AREA_YELLOW = int(os.environ.get('VISION_YELLOW_MAX_AREA', '80000'))
+MIN_CONTOUR_AREA_YELLOW = int(os.environ.get('VISION_YELLOW_MIN_AREA', '600'))    # 降低下限, 检测远距离窄条黄色
+MAX_CONTOUR_AREA_YELLOW = int(os.environ.get('VISION_YELLOW_MAX_AREA', '280000'))  # 与蓝色一致, 支持近距离大面积
 MAX_CONTOUR_AREA = 280000   # 280000 ≈ 91% of 640×480, 支持近距离大面积色块
 MIN_ASPECT_RATIO = 0.3
 MAX_ASPECT_RATIO = 3.0
 MAX_TARGETS = 10
 
 # ============ 黄色增强过滤 (替代面积暴力阈值) ============
-YELLOW_CIRCULARITY_MIN = float(os.environ.get('VISION_YELLOW_CIRC', '0.35'))  # 圆度下限, 能量块~0.5-0.8
-YELLOW_H_STD_MAX = int(os.environ.get('VISION_YELLOW_H_STD', '18'))           # H通道标准差上限
+YELLOW_CIRCULARITY_MIN = float(os.environ.get('VISION_YELLOW_CIRC', '0.15'))  # 圆度下限, AprilTag使能量块外形不规则
+YELLOW_H_STD_MAX = int(os.environ.get('VISION_YELLOW_H_STD', '25'))           # H通道标准差上限 (放宽, 斜面光照不均)
 FRAME_BOTTOM_EXCLUDE = float(os.environ.get('VISION_BOTTOM_EXCL', '0.12'))    # 忽略画面底部12%
 
 # ============ 友方近距离报警 (双色模式防误发F) ============
@@ -229,24 +229,31 @@ HSV_BLACK = {
                        int(os.environ.get('VISION_BLACK_S_MAX', '100')),
                        int(os.environ.get('VISION_BLACK_V_MAX', '60'))]),
 }
-DROP_BLACK_RATIO_THRESHOLD = float(os.environ.get('VISION_DROP_BLACK_RATIO', '0.50'))
+# 迟滞阈值: ratio > HIGH → 开始发G, ratio < LOW → 停止发G, 防止 G↔X 震荡
+DROP_BLACK_RATIO_HIGH = float(os.environ.get('VISION_DROP_RATIO_HIGH', '0.50'))  # G 启动阈值
+DROP_BLACK_RATIO_LOW = float(os.environ.get('VISION_DROP_RATIO_LOW', '0.30'))    # G 退出阈值
+DROP_BLACK_RATIO_THRESHOLD = DROP_BLACK_RATIO_HIGH  # 兼容旧引用
+DROP_G_CONFIRM_FRAMES = int(os.environ.get('VISION_DROP_CONFIRM', '3'))  # 连续N帧超阈值才首次发G
 DROP_SEND_INTERVAL = float(os.environ.get('VISION_DROP_INTERVAL', '0.05'))  # 20Hz
 DROP_V_OFFSET = int(os.environ.get('VISION_DROP_V_OFFSET', '15'))  # P25 + offset for adaptive V threshold
-DROP_RECOVERY_TIMEOUT = float(os.environ.get('VISION_DROP_TIMEOUT', '15.0'))  # 掉台回复超时(秒)
-DROP_RATIO_EMA = float(os.environ.get('VISION_DROP_RATIO_EMA', '0.4'))  # ratio时间EMA平滑系数 (0=全平滑, 1=无平滑)
-DROP_DIR_EMA = float(os.environ.get('VISION_DROP_DIR_EMA', '0.3'))      # 掉台方向EMA平滑系数
+# 超时适配远程固件: SPIN+FORWARD(1000)+BACK(2000)+ESCAPE(850)≈4s/轮, 留5轮余量
+DROP_RECOVERY_TIMEOUT = float(os.environ.get('VISION_DROP_TIMEOUT', '25.0'))
+DROP_RATIO_EMA = float(os.environ.get('VISION_DROP_RATIO_EMA', '0.35'))  # ratio EMA (稍降→更平滑)
+DROP_DIR_EMA = float(os.environ.get('VISION_DROP_DIR_EMA', '0.25'))      # direction EMA (稍降→更平滑)
 
 # ============ 回声确认 (STM32回传) ============
 ECHO_ENABLED = os.environ.get('VISION_ECHO', '1') != '0'         # 启用回声解析
 ECHO_TIMEOUT = float(os.environ.get('VISION_ECHO_TIMEOUT', '1.0'))  # 回声超时(秒), 超时视为通信异常
 
-# ============ AprilTag 辅助检测 ============
+# ============ AprilTag 融合检测 ============
 TAG_DETECT_ENABLED = os.environ.get('VISION_TAG', '1') != '0'
-TAG_DETECT_INTERVAL = int(os.environ.get('VISION_TAG_INTERVAL', '3'))  # 每N帧检测一次
-TAG_BACKEND = os.environ.get('VISION_TAG_BACKEND', 'aruco')  # aruco/apriltag/qr
+TAG_DETECT_INTERVAL = int(os.environ.get('VISION_TAG_INTERVAL', '3'))  # 全帧Tag扫描间隔 (仅无颜色目标时)
+TAG_BACKEND = os.environ.get('VISION_TAG_BACKEND', 'apriltag')  # apriltag(推荐)/aruco/qr
 TAG_ID_NEUTRAL = 0   # 中立能量块
 TAG_ID_BLUE = 1      # 蓝方能量块
 TAG_ID_YELLOW = 2    # 黄方能量块
+TAG_ROI_MARGIN = int(os.environ.get('VISION_TAG_ROI_MARGIN', '40'))    # ROI扩展边距(px), 颜色目标周围搜Tag
+TAG_ROI_MATCH_DIST = int(os.environ.get('VISION_TAG_MATCH_DIST', '80'))  # Tag-颜色匹配最大距离(px)
 
 # ============ 标定文件自动加载 ============
 def _load_calibration():

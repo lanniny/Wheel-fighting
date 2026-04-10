@@ -757,39 +757,48 @@ class TagDetector:
             return 'F' if tag_id == yellow_id else 'E'
 
     def __init__(self, backend=None):
-        self.backend = backend or getattr(config, 'TAG_BACKEND', 'aruco')
-        if backend == 'qr':
+        self.backend = backend or getattr(config, 'TAG_BACKEND', 'apriltag')
+        if self.backend == 'qr':
             self._qr = cv2.QRCodeDetector()
-        elif backend == 'aruco':
+        elif self.backend == 'apriltag':
+            # 优先 dt-apriltags (预编译 aarch64 wheel), 回退 pupil-apriltags
             try:
-                aruco = cv2.aruco
-                # OpenCV 4.7+ 新 API
-                if hasattr(aruco, 'getPredefinedDictionary'):
-                    self._aruco_dict = aruco.getPredefinedDictionary(
-                        aruco.DICT_APRILTAG_36h11)
-                else:
-                    self._aruco_dict = aruco.Dictionary_get(
-                        aruco.DICT_APRILTAG_36h11)
-                if hasattr(aruco, 'DetectorParameters'):
-                    self._aruco_params = aruco.DetectorParameters()
-                else:
-                    self._aruco_params = aruco.DetectorParameters_create()
-                # OpenCV 4.8+ ArucoDetector 对象
-                self._aruco_detector = (
-                    aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
-                    if hasattr(aruco, 'ArucoDetector') else None)
-            except Exception as e:
-                print(f'[WARN] aruco backend unavailable: {e}, falling back to QR')
-                self.backend = 'qr'
-                self._qr = cv2.QRCodeDetector()
-        elif backend == 'apriltag':
-            try:
-                from pupil_apriltags import Detector
+                from dt_apriltags import Detector
                 self._at = Detector(families='tag36h11')
+                print('[TAG] dt-apriltags backend OK')
             except ImportError:
-                print('[WARN] pupil-apriltags not installed, falling back to QR')
-                self.backend = 'qr'
-                self._qr = cv2.QRCodeDetector()
+                try:
+                    from pupil_apriltags import Detector
+                    self._at = Detector(families='tag36h11')
+                    print('[TAG] pupil-apriltags backend OK')
+                except ImportError:
+                    print('[WARN] apriltag libs not installed, falling back to aruco')
+                    self.backend = 'aruco'
+                    self._init_aruco()
+        elif self.backend == 'aruco':
+            self._init_aruco()
+
+    def _init_aruco(self):
+        """初始化 OpenCV ArUco 后端 (兼容旧版, 不建议用于实际 AprilTag)"""
+        try:
+            aruco = cv2.aruco
+            if hasattr(aruco, 'getPredefinedDictionary'):
+                self._aruco_dict = aruco.getPredefinedDictionary(
+                    aruco.DICT_APRILTAG_36h11)
+            else:
+                self._aruco_dict = aruco.Dictionary_get(
+                    aruco.DICT_APRILTAG_36h11)
+            if hasattr(aruco, 'DetectorParameters'):
+                self._aruco_params = aruco.DetectorParameters()
+            else:
+                self._aruco_params = aruco.DetectorParameters_create()
+            self._aruco_detector = (
+                aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
+                if hasattr(aruco, 'ArucoDetector') else None)
+        except Exception as e:
+            print(f'[WARN] aruco backend unavailable: {e}, falling back to QR')
+            self.backend = 'qr'
+            self._qr = cv2.QRCodeDetector()
 
     def detect_tags(self, frame):
         """
@@ -803,6 +812,69 @@ class TagDetector:
         elif self.backend == 'apriltag':
             return self._detect_apriltag(frame)
         return []
+
+    def detect_tags_in_rois(self, frame, targets):
+        """在颜色目标的 ROI 区域内检测 Tag (比全帧快很多)。
+
+        对每个 Target 的 bounding box 扩展 margin 后裁剪灰度图,
+        仅在小区域内检测, 坐标映射回全帧。支持 apriltag 和 aruco 后端。
+
+        Args:
+            frame: BGR 全帧
+            targets: ColorDetector.detect() 返回的 Target 列表
+        Returns:
+            list of {'id': int, 'cx': int, 'cy': int, 'area': int}
+        """
+        if self.backend not in ('apriltag', 'aruco') or not targets:
+            return []
+
+        margin = getattr(config, 'TAG_ROI_MARGIN', 40)
+        fh, fw = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        all_tags = []
+
+        for t in targets:
+            x1 = max(0, t.x - margin)
+            y1 = max(0, t.y - margin)
+            x2 = min(fw, t.x + t.w + margin)
+            y2 = min(fh, t.y + t.h + margin)
+            roi = gray[y1:y2, x1:x2]
+            if roi.size < 100:
+                continue
+
+            if self.backend == 'apriltag':
+                try:
+                    results = self._at.detect(roi)
+                except Exception:
+                    continue
+                for r in results:
+                    cx = int(r.center[0]) + x1
+                    cy = int(r.center[1]) + y1
+                    pts = r.corners
+                    tw = int(pts[:, 0].max() - pts[:, 0].min())
+                    th = int(pts[:, 1].max() - pts[:, 1].min())
+                    all_tags.append({'id': r.tag_id, 'cx': cx, 'cy': cy,
+                                     'area': tw * th})
+            else:  # aruco
+                try:
+                    if getattr(self, '_aruco_detector', None) is not None:
+                        corners, ids, _ = self._aruco_detector.detectMarkers(roi)
+                    else:
+                        corners, ids, _ = cv2.aruco.detectMarkers(
+                            roi, self._aruco_dict, parameters=self._aruco_params)
+                except Exception:
+                    continue
+                if ids is None:
+                    continue
+                for i, marker_id in enumerate(ids.flatten()):
+                    pts = corners[i][0]
+                    cx = int(pts[:, 0].mean()) + x1
+                    cy = int(pts[:, 1].mean()) + y1
+                    tw = int(pts[:, 0].max() - pts[:, 0].min())
+                    th = int(pts[:, 1].max() - pts[:, 1].min())
+                    all_tags.append({'id': int(marker_id), 'cx': cx, 'cy': cy,
+                                     'area': tw * th})
+        return all_tags
 
     def _detect_qr(self, frame):
         data, points, _ = self._qr.detectAndDecode(frame)

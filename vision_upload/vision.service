@@ -7,11 +7,11 @@ Wants=dev-ttySTM32.device
 Type=simple
 User=radxa
 WorkingDirectory=/home/radxa/vision_upload
-# 等待 USB 设备枚举完成 (CH340 开机后 ~3s 才就绪)
-ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5; do [ -e /dev/ttySTM32 ] && exit 0; sleep 1; done; echo "WARN: ttySTM32 not found, starting anyway"'
+# 等待 USB 设备枚举 (CH340 ~2-3s), 每0.3s检查, 最多等3s
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 10); do [ -e /dev/ttySTM32 ] && exit 0; sleep 0.3; done; echo "WARN: ttySTM32 not found"'
 ExecStart=/usr/bin/python3 main.py --color b --priority-mode attack
 Restart=always
-RestartSec=3
+RestartSec=1
 # 使用 udev 稳定符号链接, 不再硬编码 ttyUSB0
 Environment=VISION_UART=/dev/ttySTM32
 Environment=VISION_CLAHE=1
