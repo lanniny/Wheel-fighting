@@ -132,27 +132,50 @@ FRIEND_ALERT_AREA = int(os.environ.get('VISION_FRIEND_ALERT', '15000'))  # 友�
 
 # ============ 串口通信 (支持环境变量覆盖) ============
 def _find_uart():
-    """自动探测 UART 设备: 环境变量 > USB转TTL自动探测 > GPIO UART 回退"""
-    env_uart = os.environ.get('VISION_UART')
-    if env_uart:
-        # 环境变量指定了具体设备, 但如果不存在则尝试探测
-        if os.path.exists(env_uart):
-            return env_uart
-        print(f'[UART] {env_uart} not found, auto-detecting...')
+    """自动探测 UART 设备 (容错增强版)。
 
-    # 自动探测 USB转TTL (ttyUSB*)
+    优先级: 环境变量 > udev符号链接 > USB设备扫描 > GPIO UART
+    开机时 USB 枚举可能滞后, 最多重试 UART_PROBE_RETRIES 次。
+    """
     import glob
-    usb_devs = sorted(glob.glob('/dev/ttyUSB*'))
-    if usb_devs:
-        print(f'[UART] Auto-detected: {usb_devs[0]}')
-        return usb_devs[0]
+    import time as _time
 
-    # 回退到 GPIO UART
-    if os.path.exists('/dev/ttyAS1'):
-        print('[UART] Fallback to GPIO: /dev/ttyAS1')
-        return '/dev/ttyAS1'
+    max_retries = int(os.environ.get('VISION_UART_RETRIES', '5'))
+    retry_interval = 2.0  # 秒
 
-    return '/dev/ttyUSB0'  # 最终回退
+    for attempt in range(max_retries):
+        # 1) 环境变量指定
+        env_uart = os.environ.get('VISION_UART')
+        if env_uart and os.path.exists(env_uart):
+            if attempt > 0:
+                print(f'[UART] Found {env_uart} on attempt {attempt + 1}')
+            return env_uart
+
+        # 2) udev 稳定符号链接 (不受 USB 设备号漂移影响)
+        if os.path.exists('/dev/ttySTM32'):
+            real = os.path.realpath('/dev/ttySTM32')
+            print(f'[UART] Symlink /dev/ttySTM32 -> {real}')
+            return '/dev/ttySTM32'
+
+        # 3) USB 设备扫描
+        usb_devs = sorted(glob.glob('/dev/ttyUSB*'))
+        if usb_devs:
+            print(f'[UART] Auto-detected: {usb_devs[0]}')
+            return usb_devs[0]
+
+        # 4) GPIO UART 回退
+        if os.path.exists('/dev/ttyAS1'):
+            print('[UART] Fallback to GPIO: /dev/ttyAS1')
+            return '/dev/ttyAS1'
+
+        # 没找到, 等待 USB 枚举
+        if attempt < max_retries - 1:
+            print(f'[UART] No device found, retry {attempt + 1}/{max_retries} '
+                  f'in {retry_interval:.0f}s (USB enumeration may be slow)...')
+            _time.sleep(retry_interval)
+
+    print('[UART] WARNING: no device after retries, defaulting /dev/ttyUSB0')
+    return '/dev/ttyUSB0'
 
 UART_PORT = _find_uart()
 UART_BAUD = 115200
@@ -206,8 +229,16 @@ HSV_BLACK = {
                        int(os.environ.get('VISION_BLACK_S_MAX', '100')),
                        int(os.environ.get('VISION_BLACK_V_MAX', '60'))]),
 }
-DROP_BLACK_RATIO_THRESHOLD = float(os.environ.get('VISION_DROP_BLACK_RATIO', '0.60'))
+DROP_BLACK_RATIO_THRESHOLD = float(os.environ.get('VISION_DROP_BLACK_RATIO', '0.50'))
 DROP_SEND_INTERVAL = float(os.environ.get('VISION_DROP_INTERVAL', '0.05'))  # 20Hz
+DROP_V_OFFSET = int(os.environ.get('VISION_DROP_V_OFFSET', '15'))  # P25 + offset for adaptive V threshold
+DROP_RECOVERY_TIMEOUT = float(os.environ.get('VISION_DROP_TIMEOUT', '15.0'))  # 掉台回复超时(秒)
+DROP_RATIO_EMA = float(os.environ.get('VISION_DROP_RATIO_EMA', '0.4'))  # ratio时间EMA平滑系数 (0=全平滑, 1=无平滑)
+DROP_DIR_EMA = float(os.environ.get('VISION_DROP_DIR_EMA', '0.3'))      # 掉台方向EMA平滑系数
+
+# ============ 回声确认 (STM32回传) ============
+ECHO_ENABLED = os.environ.get('VISION_ECHO', '1') != '0'         # 启用回声解析
+ECHO_TIMEOUT = float(os.environ.get('VISION_ECHO_TIMEOUT', '1.0'))  # 回声超时(秒), 超时视为通信异常
 
 # ============ AprilTag 辅助检测 ============
 TAG_DETECT_ENABLED = os.environ.get('VISION_TAG', '1') != '0'

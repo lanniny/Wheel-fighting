@@ -305,9 +305,15 @@ class VisionSystem:
                 if cmd:
                     extra = ''
                     if cmd == 'D':
+                        self._drop_start_time = time.time()
+                        self.detector.reset_drop_ema()
                         extra = ' → DROP RECOVERY MODE'
-                    elif cmd == 's' and not self.comm.drop_recovery:
-                        extra = ' → NORMAL DETECT MODE'
+                    elif cmd in ('s', 'S'):
+                        if hasattr(self, '_drop_start_time'):
+                            del self._drop_start_time
+                        self.detector.reset_drop_ema()
+                        if not self.comm.drop_recovery:
+                            extra = ' → NORMAL DETECT MODE'
                     print(f'\n[UART] Cmd: {cmd!r} my_color={self.comm.my_color}{extra}')
                     det_logger.info('UART_CMD %s color=%s%s', cmd, self.comm.my_color, extra)
 
@@ -329,10 +335,26 @@ class VisionSystem:
 
                 # 3. 掉台回复模式: 黑色(台面)检测
                 if self.comm.drop_recovery:
-                    ratio, bcx, bcy, bdir = self.detector.detect_black_ratio(frame)
+                    # 超时保护: 防止永久卡在掉台回复模式
+                    drop_timeout = getattr(config, 'DROP_RECOVERY_TIMEOUT', 15.0)
+                    if not hasattr(self, '_drop_start_time'):
+                        self._drop_start_time = time.time()
+                    drop_elapsed = time.time() - self._drop_start_time
+
+                    if drop_elapsed >= drop_timeout:
+                        det_logger.info('DROP_TIMEOUT %.1fs elapsed, auto-exit', drop_elapsed)
+                        print(f'\n[DROP] Timeout {drop_elapsed:.1f}s, auto-exit to normal mode')
+                        self.comm.drop_recovery = False
+                        del self._drop_start_time
+                        self.detector.reset_drop_ema()
+                        self._sleep_until(next_frame)
+                        next_frame += frame_dt
+                        continue
+
+                    ratio, bcx, bcy, bdir, dbg = self.detector.detect_black_ratio(frame)
                     t_det = time.perf_counter()
 
-                    threshold = getattr(config, 'DROP_BLACK_RATIO_THRESHOLD', 0.55)
+                    threshold = getattr(config, 'DROP_BLACK_RATIO_THRESHOLD', 0.50)
                     ratio_pct = int(ratio * 100)
                     if ratio >= threshold:
                         self.comm.send_target('G', bcx, bcy, ratio_pct, bdir)
@@ -344,23 +366,46 @@ class VisionSystem:
                     frame_idx += 1
                     dt_ms = (time.perf_counter() - t0) * 1000
 
+                    # 回声状态
+                    echo_ok = self.comm.echo_confirmed
+                    echo_lag = self.comm._echo_latency
+
                     # 日志
-                    det_logger.info('DROP ratio=%d%% cx=%d dir=%+.2f %s %.0fms',
-                                    ratio_pct, bcx, bdir,
+                    det_logger.info('DROP ratio=%d%% blob=%d%% cx=%d dir=%+.2f %s echo=%s %.0fms',
+                                    ratio_pct,
+                                    int(dbg['blob_ratio'] * 100),
+                                    bcx, bdir,
                                     'GO' if ratio >= threshold else 'wait',
+                                    f'{self.comm.echo_type}' if echo_ok else '-',
                                     dt_ms)
                     if frame_idx % 30 == 0:
-                        det_logger.info('DROP_DBG Vmean=%.0f Vstd=%.0f th=%.0f%%',
-                                        self.detector._v_ema,
-                                        0.0, threshold * 100)
+                        det_logger.info(
+                            'DROP_DBG Vmean=%.0f Vstd=%.1f Sstd=%.1f '
+                            'Vp25=%.0f Vth=%d raw=%d%% blob=%d%% '
+                            'bonus=%.0f%% inst=%d%% th=%d%% '
+                            'echo=%d lag=%.0fms timeout=%.0f/%.0fs',
+                            dbg['v_mean'], dbg['v_std'], dbg['s_std'],
+                            dbg['v_p25'], dbg['v_th'],
+                            int(dbg['raw_ratio'] * 100),
+                            int(dbg['blob_ratio'] * 100),
+                            dbg['bonus'] * 100,
+                            int(dbg.get('instant_ratio', ratio) * 100),
+                            int(threshold * 100),
+                            self.comm._echo_count, echo_lag,
+                            drop_elapsed, drop_timeout)
 
                     # 终端输出
                     if frame_idx % 10 == 0:
                         status = 'GO!' if ratio >= threshold else 'wait'
+                        echo_str = (f'E:{self.comm.echo_type} {echo_lag:.0f}ms'
+                                    if echo_ok else 'E:--')
+                        if not self.comm.echo_healthy and self.comm._echo_count > 0:
+                            echo_str = 'E:LOST!'
                         sys.stdout.write(
                             f'\r[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
-                            f'DROP black={ratio_pct}% dir={bdir:+.2f} '
-                            f'{status}      ')
+                            f'DROP {ratio_pct}% blob={int(dbg["blob_ratio"]*100)}% '
+                            f'dir={bdir:+.2f} {status} {echo_str} '
+                            f'[{drop_elapsed:.0f}/{drop_timeout:.0f}s]      ')
                         sys.stdout.flush()
 
                     # 流媒体: 标注黑色检测结果
@@ -373,10 +418,16 @@ class VisionSystem:
                                       color, 2)
                         cv2.drawMarker(annotated, (bcx, bcy), color,
                                        cv2.MARKER_CROSS, 20, 2)
-                        info = (f'DROP {ratio_pct}% dir={bdir:+.2f} '
-                                f'{"GO!" if ratio >= threshold else "wait"}')
+                        echo_tag = ('ACK' if echo_ok else
+                                    'LOST' if not self.comm.echo_healthy else '...')
+                        info = (f'DROP {ratio_pct}% blob={int(dbg["blob_ratio"]*100)}% '
+                                f'dir={bdir:+.2f} '
+                                f'{"GO!" if ratio >= threshold else "wait"} '
+                                f'E:{echo_tag} [{drop_elapsed:.0f}s]')
                         cv2.putText(annotated, info, (10, 25),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                        # 回声确认状态栏
+                        annotated = self._draw_echo_status(annotated)
                         _publish_frame(annotated)
 
                     self._sleep_until(next_frame)
@@ -549,6 +600,8 @@ class VisionSystem:
                     cv2.putText(annotated, info, (10, 25),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 (0, 255, 0), 2)
+                    # 回声确认状态栏 (第二行)
+                    annotated = self._draw_echo_status(annotated)
                     t_anno_end = time.perf_counter()
                     _publish_frame(annotated)
                 t_stream = time.perf_counter()
@@ -595,6 +648,61 @@ class VisionSystem:
             self.comm.close()
             det_logger.info('=== Vision stopped ===')
             print('Vision system stopped.')
+
+    def _draw_echo_status(self, frame):
+        """在画面底部绘制 STM32 回声确认状态栏。
+
+        显示:
+          - 绿色圆点 + 'STM32 ACK' + 延迟: 确认收到
+          - 黄色圆点 + 'STM32 ...'       : 等待回声 (还没收到过)
+          - 红色圆点 + 'STM32 LOST'      : 回声丢失 (超时)
+          - 灰色圆点 + 'ECHO OFF'        : 回声功能未启用
+        """
+        h, w = frame.shape[:2]
+        bar_y = h - 30  # 状态栏 y 位置
+
+        if not self.comm._echo_enabled:
+            # 未启用
+            cv2.circle(frame, (15, bar_y + 5), 6, (128, 128, 128), -1)
+            cv2.putText(frame, 'ECHO OFF', (28, bar_y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 128, 128), 1)
+            return frame
+
+        echo_ok = self.comm.echo_confirmed
+        echo_healthy = self.comm.echo_healthy
+        echo_count = self.comm._echo_count
+        lag_ms = self.comm._echo_latency
+
+        if echo_ok:
+            # 确认收到 — 绿色
+            color = (0, 255, 0)
+            cv2.circle(frame, (15, bar_y + 5), 8, color, -1)
+            text = f'STM32 ACK [{self.comm.echo_type}] {lag_ms:.0f}ms  #{echo_count}'
+            cv2.putText(frame, text, (30, bar_y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        elif echo_count == 0:
+            # 等待首个回声 — 黄色
+            color = (0, 200, 255)
+            cv2.circle(frame, (15, bar_y + 5), 8, color, -1)
+            cv2.putText(frame, 'STM32 waiting...', (30, bar_y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        elif not echo_healthy:
+            # 回声丢失 — 红色闪烁
+            color = (0, 0, 255)
+            cv2.circle(frame, (15, bar_y + 5), 8, color, -1)
+            age = self.comm.echo_age
+            text = f'STM32 LOST! last={age:.1f}s ago  #{echo_count}'
+            cv2.putText(frame, text, (30, bar_y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        else:
+            # 有过回声但当前帧未确认 — 淡绿
+            color = (0, 180, 0)
+            cv2.circle(frame, (15, bar_y + 5), 6, color, -1)
+            text = f'STM32 ok [{self.comm.echo_type}] {lag_ms:.0f}ms  #{echo_count}'
+            cv2.putText(frame, text, (30, bar_y + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+        return frame
 
     @staticmethod
     def _sleep_until(target):

@@ -1,17 +1,23 @@
 [Unit]
-Description=Robot Vision System v4
-After=network.target
+Description=Robot Vision System v6
+After=network.target dev-ttySTM32.device
+Wants=dev-ttySTM32.device
 
 [Service]
 Type=simple
 User=radxa
 WorkingDirectory=/home/radxa/vision_upload
-ExecStart=/usr/bin/python3 main.py --priority-mode collect
+# 等待 USB 设备枚举完成 (CH340 开机后 ~3s 才就绪)
+ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5; do [ -e /dev/ttySTM32 ] && exit 0; sleep 1; done; echo "WARN: ttySTM32 not found, starting anyway"'
+ExecStart=/usr/bin/python3 main.py --color b --priority-mode attack
 Restart=always
 RestartSec=3
-Environment=VISION_UART=/dev/ttyAS1
+# 使用 udev 稳定符号链接, 不再硬编码 ttyUSB0
+Environment=VISION_UART=/dev/ttySTM32
 Environment=VISION_CLAHE=1
 Environment=VISION_FPS=30
+Environment=VISION_AUTO_WB=0
+Environment=VISION_WB_TEMP=4200
 
 [Install]
 WantedBy=multi-user.target

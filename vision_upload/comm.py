@@ -15,6 +15,7 @@ UART 通信模块 v3 - 自动重连 + 颜色心跳 + 炸弹类型支持
   'c' = 收集模式      'f' = 战斗模式
   'D' = 掉台回复模式   (视觉切换到黑色检测, 发送 G/X)
 """
+import os
 import time
 import config
 
@@ -22,10 +23,13 @@ import config
 class UartComm:
     # 连续写错误超过此阈值则触发重连
     _TX_ERROR_THRESHOLD = 3
-    # 重连冷却时间 (s)
-    _RECONNECT_INTERVAL = 2.0
+    # 重连冷却: 指数退避 (2→4→8→8s)
+    _RECONNECT_BASE = 2.0
+    _RECONNECT_MAX = 8.0
     # 颜色心跳周期 (s): 定期重发己方颜色，防止STM32丢失初始颜色
     _COLOR_HEARTBEAT_INTERVAL = 5.0
+    # 设备存在性检查间隔 (s): 比发送频率低, 减少 stat() 系统调用
+    _DEVICE_CHECK_INTERVAL = 3.0
 
     def __init__(self):
         self.ser = None
@@ -39,8 +43,12 @@ class UartComm:
         self._no_target_interval = 0.2  # 无目标时降到 5Hz, 节省带宽
         self._fast_interval = 0.033  # 快速运动时 30Hz
         self._tx_errors = 0
+        self._rx_errors = 0          # 读取错误计数
         self._last_reconnect = 0.0
+        self._reconnect_backoff = self._RECONNECT_BASE
         self._last_color_send = 0.0
+        self._last_device_check = 0.0
+        self._port_path = None       # 当前使用的设备路径
         # 发送统计
         self._tx_total = 0
         self._tx_success = 0
@@ -50,6 +58,16 @@ class UartComm:
         self._dir_window = []
         self._dir_smooth_size = getattr(
             __import__('config'), 'DIRECTION_SMOOTH_WINDOW', 3)
+        # RX 缓冲区: 累积接收数据, 分离回声帧和单字节命令
+        self._rx_buf = b''
+        # 回声确认: STM32 回传的最近一帧
+        self.echo_type = None        # 回声帧类型 ('E'/'G'/'X'/...)
+        self.echo_ts = 0.0           # 回声接收时间戳
+        self._echo_enabled = getattr(config, 'ECHO_ENABLED', True)
+        self._echo_timeout = getattr(config, 'ECHO_TIMEOUT', 1.0)
+        self._last_tx_ts = 0.0       # 最近一次发送时间戳
+        self._echo_count = 0         # 累计收到的回声帧数
+        self._echo_latency = 0.0     # 最近一次回声往返延迟(ms)
 
     # ------------------------------------------------------------------
     # 开关
@@ -60,6 +78,7 @@ class UartComm:
             import serial
             # 重新探测设备 (USB设备号可能变化)
             port = config._find_uart()
+            self._port_path = port
             self.ser = serial.Serial(
                 port=port,
                 baudrate=config.UART_BAUD,
@@ -67,16 +86,21 @@ class UartComm:
                 write_timeout=0.05,
             )
             # 启用 low_latency 模式 (减少内核缓冲延迟)
+            # 解析真实设备路径 (符号链接 → 实际设备)
+            real_port = os.path.realpath(port) if os.path.islink(port) else port
             try:
                 import subprocess
-                subprocess.run(['stty', '-F', port, 'low_latency'],
+                subprocess.run(['stty', '-F', real_port, 'low_latency'],
                                capture_output=True, timeout=2)
             except Exception:
                 pass
-            # 清空残留数据
+            # 清空残留数据 (USB 断联重连后可能有脏数据)
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
             self._tx_errors = 0
+            self._rx_errors = 0
+            self._reconnect_backoff = self._RECONNECT_BASE  # 重连成功, 重置退避
+            self._last_device_check = time.time()
             print(f'UART opened: {port} @ {config.UART_BAUD} (low_latency)')
             return True
         except Exception as e:
@@ -96,17 +120,35 @@ class UartComm:
     # 内部: 重连
     # ------------------------------------------------------------------
     def _try_reconnect(self):
-        """限速重连: 冷却期内不重复尝试, 重连时重新探测设备号"""
+        """指数退避重连: 2→4→8→8s, 重连时重新探测设备号"""
         now = time.time()
-        if now - self._last_reconnect < self._RECONNECT_INTERVAL:
+        if now - self._last_reconnect < self._reconnect_backoff:
             return
         self._last_reconnect = now
-        print('[UART] Reconnecting (re-detecting device)...')
+        print(f'[UART] Reconnecting (backoff={self._reconnect_backoff:.0f}s)...')
         self.close()
         if self.open():
             print('[UART] Reconnected OK')
         else:
-            print('[UART] Reconnect failed, will retry')
+            # 指数退避: 2→4→8→8s
+            self._reconnect_backoff = min(
+                self._reconnect_backoff * 2, self._RECONNECT_MAX)
+            print(f'[UART] Reconnect failed, next retry in '
+                  f'{self._reconnect_backoff:.0f}s')
+
+    def _check_device_alive(self):
+        """周期性检查 USB 设备是否还存在 (热拔插感知)。
+        比等 TX 报错更快发现断开。
+        """
+        now = time.time()
+        if now - self._last_device_check < self._DEVICE_CHECK_INTERVAL:
+            return True
+        self._last_device_check = now
+        if self._port_path and not os.path.exists(self._port_path):
+            print(f'[UART] Device {self._port_path} disappeared! (USB unplug?)')
+            self.close()
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # 内部: 校验
@@ -120,44 +162,182 @@ class UartComm:
         return f'{cs:02X}'
 
     # ------------------------------------------------------------------
-    # 读指令
+    # 内部: 单字节命令解析
     # ------------------------------------------------------------------
-    def read_command(self):
-        """非阻塞读取 STM32 单字节指令, 返回指令字符或 None"""
-        if not self.ser:
-            return None
+    def _parse_cmd_byte(self, ch):
+        """解析单字节命令, 返回命令字符或 None"""
+        if ch in ('b', 'y'):
+            old = self.my_color
+            self.my_color = ch
+            if old != ch:
+                self._color_changed = True
+            return ch
+        if ch == 's' or ch == 'S':
+            self.active = True
+            self.drop_recovery = False
+            return 's'
+        if ch == 'p':
+            self.active = False
+            return ch
+        if ch == 'D':
+            self.drop_recovery = True
+            return ch
+        if ch == 'c':
+            self.mode = 'collect'
+            return ch
+        if ch == 'f':
+            self.mode = 'fight'
+            return ch
+        return None
+
+    # ------------------------------------------------------------------
+    # 内部: 回声帧解析
+    # ------------------------------------------------------------------
+    def _parse_echo_frame(self, frame_bytes):
+        """解析 STM32 回传的 $type,cx,cy,area,dir*CS\\n 帧。
+        更新 echo_type / echo_ts / echo_latency。
+        """
         try:
-            if self.ser.in_waiting <= 0:
-                return None
-            data = self.ser.read(self.ser.in_waiting)
-            # 取最后一条有效指令（覆盖式: 最新的生效）
-            for byte in reversed(data):
-                ch = chr(byte)
-                if ch in ('b', 'y'):
-                    old = self.my_color
-                    self.my_color = ch
-                    if old != ch:
-                        self._color_changed = True
-                    return ch
-                if ch == 's' or ch == 'S':
-                    self.active = True
-                    self.drop_recovery = False
-                    return 's'
-                if ch == 'p':
-                    self.active = False
-                    return ch
-                if ch == 'D':
-                    self.drop_recovery = True
-                    return ch
-                if ch == 'c':
-                    self.mode = 'collect'
-                    return ch
-                if ch == 'f':
-                    self.mode = 'fight'
-                    return ch
+            text = frame_bytes.decode('ascii', errors='ignore').strip()
+            if not text.startswith('$') or '*' not in text:
+                return
+            body_cs = text[1:]  # 去掉 '$'
+            star_idx = body_cs.rfind('*')
+            if star_idx < 0:
+                return
+            body = body_cs[:star_idx]
+            cs_str = body_cs[star_idx + 1:]
+
+            # 校验和验证
+            expected = 0
+            for b in body.encode():
+                expected ^= b
+            if len(cs_str) >= 2:
+                received = int(cs_str[:2], 16)
+                if expected != received:
+                    return  # 校验失败, 丢弃
+
+            # 解析类型字段
+            parts = body.split(',')
+            if parts:
+                now = time.time()
+                self.echo_type = parts[0]
+                self.echo_ts = now
+                self._echo_count += 1
+                # 计算往返延迟
+                if self._last_tx_ts > 0:
+                    self._echo_latency = (now - self._last_tx_ts) * 1000
         except Exception:
             pass
-        return None
+
+    # ------------------------------------------------------------------
+    # 读指令 (v2: 分离回声帧 + 单字节命令)
+    # ------------------------------------------------------------------
+    def read_command(self):
+        """非阻塞读取 STM32 数据, 分离回声帧和单字节命令。
+
+        RX 缓冲区中混合了:
+          - 单字节命令: 'b','y','s','p','c','f','D'
+          - 回声帧: $type,cx,cy,area,dir*CS\\n (STM32原样回传)
+
+        策略: 用 '$' 和 '\\n' 定界回声帧, 帧外散字节扫描命令。
+        返回最后一条有效命令字符, 或 None。
+        """
+        if not self.ser:
+            self._try_reconnect()
+            return None
+
+        if not self._check_device_alive():
+            self._try_reconnect()
+            return None
+
+        try:
+            if self.ser.in_waiting <= 0:
+                # 即使没新数据, 也处理残余缓冲
+                if not self._rx_buf:
+                    return None
+            else:
+                data = self.ser.read(self.ser.in_waiting)
+                self._rx_errors = 0
+                self._rx_buf += data
+        except OSError as e:
+            self._rx_errors += 1
+            if self._rx_errors >= self._TX_ERROR_THRESHOLD:
+                print(f'[UART] RX error #{self._rx_errors}: {e}, reconnecting')
+                self._try_reconnect()
+                self._rx_errors = 0
+            return None
+        except Exception:
+            return None
+
+        # 防止缓冲区溢出 (丢弃旧数据)
+        if len(self._rx_buf) > 1024:
+            self._rx_buf = self._rx_buf[-512:]
+
+        cmd = None
+        new_buf = b''
+        buf = self._rx_buf
+        pos = 0
+
+        while pos < len(buf):
+            dollar = buf.find(b'$', pos)
+
+            if dollar < 0:
+                # 无帧头: 剩余全是散字节, 扫描命令
+                for i in range(pos, len(buf)):
+                    c = self._parse_cmd_byte(chr(buf[i]))
+                    if c:
+                        cmd = c
+                break
+
+            # '$' 前的散字节: 扫描命令
+            for i in range(pos, dollar):
+                c = self._parse_cmd_byte(chr(buf[i]))
+                if c:
+                    cmd = c
+
+            # 从 '$' 开始找 '\n' (帧结尾)
+            newline = buf.find(b'\n', dollar)
+            if newline < 0:
+                # 帧不完整, 保留到下次
+                new_buf = buf[dollar:]
+                break
+
+            # 提取完整帧并解析回声
+            frame = buf[dollar:newline + 1]
+            if self._echo_enabled:
+                self._parse_echo_frame(frame)
+
+            pos = newline + 1
+
+        self._rx_buf = new_buf
+        return cmd
+
+    # ------------------------------------------------------------------
+    # 回声状态查询
+    # ------------------------------------------------------------------
+    @property
+    def echo_confirmed(self):
+        """最近一次发送是否已收到回声确认"""
+        if not self._echo_enabled or self.echo_ts <= 0:
+            return False
+        return self.echo_ts >= self._last_tx_ts
+
+    @property
+    def echo_age(self):
+        """距离最近一次回声的时间(秒)"""
+        if self.echo_ts <= 0:
+            return float('inf')
+        return time.time() - self.echo_ts
+
+    @property
+    def echo_healthy(self):
+        """回声通道是否健康 (超时判定)"""
+        if not self._echo_enabled:
+            return True  # 未启用则不告警
+        if self._echo_count == 0:
+            return True  # 还没收到过回声, 不判定
+        return self.echo_age < self._echo_timeout
 
     # ------------------------------------------------------------------
     # 发送目标
@@ -191,8 +371,8 @@ class UartComm:
         if now - self._last_send < interval:
             return
 
-        # 串口不可用则尝试重连
-        if not self.ser:
+        # 串口不可用 或 设备消失 → 重连
+        if not self.ser or not self._check_device_alive():
             self._try_reconnect()
             return
 
@@ -207,8 +387,19 @@ class UartComm:
             msg = f'${body}*{cs}\n'
             self.ser.write(msg.encode())
             self._last_send = now
+            self._last_tx_ts = now
             self._tx_errors = 0
             self._tx_success += 1
+        except OSError as e:
+            # USB 断开: errno 5/6/19, 立即重连
+            self._tx_errors += 1
+            err_no = getattr(e, 'errno', 0)
+            if err_no in (5, 6, 19):  # EIO, ENXIO, ENODEV
+                print(f'[UART] Device error (errno={err_no}), reconnecting now')
+                self._try_reconnect()
+            elif self._tx_errors >= self._TX_ERROR_THRESHOLD:
+                print(f'[UART] TX error #{self._tx_errors}: {e}, reconnecting')
+                self._try_reconnect()
         except Exception as e:
             self._tx_errors += 1
             if self._tx_errors >= self._TX_ERROR_THRESHOLD:

@@ -195,6 +195,10 @@ class ColorDetector:
         # ROI 预测: 上帧目标 bbox
         self._last_bboxes = []
         self._frame_idx = 0
+        # 掉台检测 EMA: ratio 和 direction 时间平滑
+        self._drop_ratio_ema = 0.0
+        self._drop_dir_ema = 0.0
+        self._drop_ema_initialized = False
 
     # ------------------------------------------------------------------
     # 相机属性锁定 (已废弃 — 统一由 config.setup_camera() 处理)
@@ -524,23 +528,32 @@ class ColorDetector:
         return friends, enemies, neutrals
 
     # ------------------------------------------------------------------
+    # 掉台回复: 重置 EMA 状态 (进入/退出掉台模式时调用)
+    # ------------------------------------------------------------------
+    def reset_drop_ema(self):
+        """重置掉台检测的 EMA 平滑状态"""
+        self._drop_ratio_ema = 0.0
+        self._drop_dir_ema = 0.0
+        self._drop_ema_initialized = False
+
+    # ------------------------------------------------------------------
     # 掉台回复: 黑色(台面)检测
     # ------------------------------------------------------------------
     def detect_black_ratio(self, frame):
         """检测画面中黑色(台面)区域占比和中心位置。
 
-        自适应策略: 自动曝光会把暗场景整体提亮(黑墙V≈120), 不能
-        靠V绝对值。改用三重判据:
-          1) 低饱和度 (S < S_MAX): 黑色/灰色无彩色
-          2) V 低于自适应阈值 (V < 画面V均值 * 0.85): 相对暗区
-          3) 颜色均匀性: V 通道标准差低 (均匀暗色, 非彩色物体)
-        三个条件取交集, 对抗 AE 导致的整体亮度漂移。
+        v2 改进 (修复 V_factor=1.0 无区分力问题):
+          1) V 阈值用 percentile-25 代替均值, 选出真正的暗区而非 ~50% 噪声
+          2) 低饱和度 (S < S_MAX): 黑色/灰色无彩色
+          3) 最大连通域占比: 台面是大块连续暗区, 散乱噪点被排除
+          4) 均匀性加分需同时满足 V_std 和 S_std 低 (真正均匀暗色)
 
         Returns:
-            (ratio, cx, cy, direction)
-            ratio: 黑色面积占比 [0.0, 1.0]
+            (ratio, cx, cy, direction, dbg_info)
+            ratio: 有效黑色面积占比 [0.0, 1.0]
             cx, cy: 黑色区域质心 (全分辨率坐标)
             direction: 质心相对画面中心偏移 [-1.0, +1.0]
+            dbg_info: 诊断字典 (v_mean, v_std, s_std, raw_ratio, blob_ratio, bonus)
         """
         h, w = frame.shape[:2]
         margin_x = w // 6
@@ -551,15 +564,18 @@ class ColorDetector:
         v_ch = hsv[:, :, 2]
         s_ch = hsv[:, :, 1]
 
-        # 自适应 V 阈值: 基于画面 V 均值动态计算
         v_mean = float(v_ch.mean())
         v_std = float(v_ch.std())
-        # AE 会把暗场景整体提亮(黑墙 V≈120), V 绝对值不可靠。
-        # 改用 "低于均值" 作为暗区判据: 黑色台面的 V 集中在均值以下,
-        # 正常彩色场景的暗区像素占比远低于 50%.
+        s_std = float(s_ch.std())
+
+        # 自适应 V 阈值: 用 V 的 P25 (25th percentile) + 偏移量
+        # AE 把暗场景提亮到 V_mean≈130, 但台面像素集中在分布低端
+        # P25 代表 "偏暗的那部分", 加偏移量向上扩展覆盖台面边缘
+        v_p25 = float(np.percentile(v_ch, 25))
+        v_offset = getattr(config, 'DROP_V_OFFSET', 15)
         adaptive_v_max = max(
             int(config.HSV_BLACK['upper'][2]),       # 绝对下限 (默认60)
-            int(v_mean * 1.0),                       # 均值的100% (低于均值=暗)
+            int(v_p25 + v_offset),                   # P25 + 偏移
         )
         s_max = int(config.HSV_BLACK['upper'][1])    # 饱和度上限 (默认100)
 
@@ -577,24 +593,46 @@ class ColorDetector:
 
         total_pixels = roi.shape[0] * roi.shape[1]
         black_pixels = cv2.countNonZero(black_mask)
-        ratio = black_pixels / total_pixels if total_pixels > 0 else 0.0
+        raw_ratio = black_pixels / total_pixels if total_pixels > 0 else 0.0
 
-        # 额外加分: 画面整体 V 标准差低 → 说明整片均匀暗色, 更可能是台面
-        # V_std<30 说明几乎全黑/全暗 → ratio 加成
+        # 最大连通域占比: 台面是大块连续暗区, 散点噪声不算
+        blob_ratio = 0.0
+        blob_cx, blob_cy = roi.shape[1] // 2, roi.shape[0] // 2
+        if black_pixels > 100:
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                black_mask, connectivity=8)
+            if num_labels > 1:
+                # stats[0] 是背景, 跳过; 找最大前景连通域
+                largest_idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+                largest_area = stats[largest_idx, cv2.CC_STAT_AREA]
+                blob_ratio = largest_area / total_pixels
+                blob_cx = int(centroids[largest_idx][0])
+                blob_cy = int(centroids[largest_idx][1])
+
+        # 选择更高的: 原始像素比 vs 最大连通域比
+        # 台面场景: blob_ratio ≈ raw_ratio (大部分暗像素连成一片)
+        # 噪声场景: blob_ratio << raw_ratio (暗像素分散)
+        base_ratio = max(raw_ratio * 0.7, blob_ratio)
+
+        # 均匀性加分: V_std 和 S_std 都低 → 真正均匀暗色, 更可能是台面
         uniformity_bonus = 0.0
-        if v_std < 30:
+        if v_std < 25 and s_std < 30:
             uniformity_bonus = 0.15
-        elif v_std < 40:
+        elif v_std < 35 and s_std < 40:
             uniformity_bonus = 0.08
 
-        effective_ratio = min(1.0, ratio + uniformity_bonus)
+        effective_ratio = min(1.0, base_ratio + uniformity_bonus)
 
-        # 计算黑色区域质心
+        # 计算质心 (优先用最大连通域质心)
         cx_full = w // 2
         cy_full = h // 2
         direction = 0.0
 
-        if black_pixels > 100:
+        if blob_ratio > 0.05:
+            cx_full = blob_cx + margin_x
+            cy_full = blob_cy + margin_y
+            direction = (cx_full - w / 2) / (w / 2)
+        elif black_pixels > 100:
             moments = cv2.moments(black_mask)
             if moments['m00'] > 0:
                 cx_roi = int(moments['m10'] / moments['m00'])
@@ -603,7 +641,34 @@ class ColorDetector:
                 cy_full = cy_roi + margin_y
                 direction = (cx_full - w / 2) / (w / 2)
 
-        return effective_ratio, cx_full, cy_full, direction
+        # 时间 EMA 平滑: 减少帧间抖动, 让 ratio 和 direction 更稳定
+        ratio_alpha = getattr(config, 'DROP_RATIO_EMA', 0.4)
+        dir_alpha = getattr(config, 'DROP_DIR_EMA', 0.3)
+
+        if not self._drop_ema_initialized:
+            # 首帧初始化
+            self._drop_ratio_ema = effective_ratio
+            self._drop_dir_ema = direction
+            self._drop_ema_initialized = True
+        else:
+            self._drop_ratio_ema = (ratio_alpha * effective_ratio
+                                    + (1 - ratio_alpha) * self._drop_ratio_ema)
+            self._drop_dir_ema = (dir_alpha * direction
+                                  + (1 - dir_alpha) * self._drop_dir_ema)
+
+        smoothed_ratio = self._drop_ratio_ema
+        smoothed_dir = self._drop_dir_ema
+
+        dbg_info = {
+            'v_mean': v_mean, 'v_std': v_std, 's_std': s_std,
+            'v_p25': v_p25, 'v_th': adaptive_v_max,
+            'raw_ratio': raw_ratio, 'blob_ratio': blob_ratio,
+            'bonus': uniformity_bonus,
+            'instant_ratio': effective_ratio,
+            'instant_dir': direction,
+        }
+
+        return smoothed_ratio, cx_full, cy_full, smoothed_dir, dbg_info
 
     def get_priority_target(self, friends, enemies, neutrals):
         """
