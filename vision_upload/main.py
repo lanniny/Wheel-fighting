@@ -222,6 +222,7 @@ class VisionSystem:
         self._perf_count = 0
         # 握手控制
         self._handshake = handshake and use_uart
+        self._need_rehandshake = False
         # 掉台回复迟滞状态机
         self._drop_sending_G = False    # 当前是否处于发G状态
         self._drop_confirm_count = 0    # G确认帧计数器
@@ -334,6 +335,15 @@ class VisionSystem:
                 cmd = self.comm.read_command()
                 if cmd:
                     self._handle_command(cmd)
+                    # STM32 重启 → 重新进入握手阶段
+                    if self._need_rehandshake:
+                        self._need_rehandshake = False
+                        print('[HANDSHAKE] STM32 restarted, re-entering handshake...')
+                        det_logger.info('RE-HANDSHAKE triggered by N cmd')
+                        if self._run_handshake():
+                            print('Vision system v6 resumed after re-handshake.')
+                        next_frame = time.perf_counter() + frame_dt
+                        continue  # 握手后重新读帧
 
                 # 3. 掉台回复模式: 黑色(台面)检测
                 if self.comm.drop_recovery:
@@ -903,7 +913,12 @@ class VisionSystem:
             self.detector.reset_drop_ema()
             self.comm.active = True
             self.comm.drop_recovery = False
-            extra = ' → RESET TO NORMAL DETECT'
+            # STM32 重启 → 需要重新握手确认颜色
+            if self._handshake:
+                self._need_rehandshake = True
+                extra = ' → RE-HANDSHAKE'
+            else:
+                extra = ' → RESET TO NORMAL DETECT'
         elif cmd == 'D':
             self._drop_start_time = time.time()
             self._drop_sending_G = False
