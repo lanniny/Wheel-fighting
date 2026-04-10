@@ -4,7 +4,7 @@
  * @LastEditors: Xiang xin wang wxinxiang8@gmail.com
  * @LastEditTime: 2026-03-24 21:04:36
  * @FilePath: \MDK-ARMd:\robot fighting\robot\Core\Src\obstacle.c
- * @Description: 红外传感器读取模块 (含极性修正)
+ * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
 #include "obstacle.h"
 #include "gpio.h"
@@ -18,24 +18,15 @@ static GPIO_PinState invert_state(GPIO_PinState state)
 }
 
 /**
-  * @brief  初始化函数 (目前仅需要在main中调用GPIO初始化即可，此处留空或做额外设置)
-  */
-void Obs_Sensor_Init(void)
-{
-    // GPIO已经在 MX_GPIO_Init 中初始化为输入模式
-    // 此处可以添加其他的初始化代码，如果需要的话
-}
-
-/**
   * @brief  读取所有红外传感器状态
   *         建议在主循环或定时器中调用
   */
 void Obs_Sensor_ReadAll(void)
 {
   // 读取 GPIOE 上的 IR_1 到 IR_8，以及 GPIOA 上的 IR_9、IR_10
-
+    
     Obs_Data.IR1 = invert_state(HAL_GPIO_ReadPin(IR_1_GPIO_Port, IR_1_Pin));
-    Obs_Data.IR2 = invert_state(HAL_GPIO_ReadPin(IR_2_GPIO_Port, IR_2_Pin));
+    Obs_Data.IR2 = HAL_GPIO_ReadPin(IR_2_GPIO_Port, IR_2_Pin);
     Obs_Data.IR3 = HAL_GPIO_ReadPin(IR_3_GPIO_Port, IR_3_Pin);
     Obs_Data.IR4 = HAL_GPIO_ReadPin(IR_4_GPIO_Port, IR_4_Pin);
     Obs_Data.IR5 = (HAL_GPIO_ReadPin(IR_5_GPIO_Port, IR_5_Pin));
@@ -52,7 +43,7 @@ void Obs_Sensor_ReadAll(void)
 void Edge_Sensor_Detect(void)
 {
     Obs_Data.IR1 = invert_state(HAL_GPIO_ReadPin(IR_1_GPIO_Port, IR_1_Pin));
-    Obs_Data.IR2 = invert_state(HAL_GPIO_ReadPin(IR_2_GPIO_Port, IR_2_Pin));
+    Obs_Data.IR2 = HAL_GPIO_ReadPin(IR_2_GPIO_Port, IR_2_Pin);
 }
 /**
   * @brief  读取周围红外传感器状态

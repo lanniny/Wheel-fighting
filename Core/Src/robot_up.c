@@ -1,10 +1,12 @@
 #include "motor.h"
 #include "robot_up.h"
 #include "usart.h"
+#include <stdbool.h>
 
 static GoUpState GoUp_Stage = GOUP_RUSH;
 static uint32_t GoUp_StartTime = 0;
 static bool GoUp_Done = false;
+static uint8_t GoUp_ShadeCount = 0;
 TeamColor Current_Team = TEAM_NONE;
 
 /**
@@ -43,7 +45,7 @@ TeamColor Startup_WaitForTrigger(void)
             left_hold = 0;
         }
         /*右侧遮挡 蓝方*/
-        if(right == STARTUP_BLOCKED_STATE)
+        if((right) == STARTUP_BLOCKED_STATE)
         {
             right_hold += dt;
             if(right_hold >= STARTUP_DEBOUNCE_MS)
@@ -55,7 +57,7 @@ TeamColor Startup_WaitForTrigger(void)
         else
         {
             right_hold = 0;
-        }
+        }       
     }
 
     /*通知鲁班猫*/
@@ -81,9 +83,11 @@ void Startup_Notify(TeamColor team)
  */
 void GoUp_Init(void)
 {
+    Shade_Sensor_Init();
     GoUp_Stage = GOUP_RUSH;
     GoUp_StartTime = HAL_GetTick();
     GoUp_Done = false;
+    GoUp_ShadeCount = 0;
 }
 
 /**
@@ -99,14 +103,51 @@ void GoUp_Update()
     switch(GoUp_Stage)
     {
         case GOUP_RUSH:
-            /*全速倒退冲台*/
-            drive_Back_H();
+            /*梯形加速倒退冲台*/
+            if(elapsed_time < GOUP_RUSH_STAGE1_TIME)
+            {
+                drive_user_defined(-GOUP_RUSH_SPEED_STAGE1, -GOUP_RUSH_SPEED_STAGE1);
+            }
+            else if(elapsed_time < GOUP_RUSH_STAGE2_TIME)
+            {
+                drive_user_defined(-GOUP_RUSH_SPEED_STAGE2, -GOUP_RUSH_SPEED_STAGE2);
+            }
+            else
+            {
+                drive_user_defined(-GOUP_RUSH_SPEED_STAGE3, -GOUP_RUSH_SPEED_STAGE3);
+            }
+            // drive_user_defined(-GOUP_RUSH_SPEED_STAGE3, -GOUP_RUSH_SPEED_STAGE3);
+
             if(elapsed_time >= GOUP_RUSH_TIME)
+            {
+                GoUp_Stage = GOUP_CONFIRM;
+                GoUp_StartTime = current_time;
+                GoUp_ShadeCount = 0;
+            }
+            break;
+
+        case GOUP_CONFIRM:
+            MOTOR_StopAll();
+            site_detect_shade();
+            if(voltage_v0 < 2.9f && voltage_v1 < 2.9f)
+            {
+                if(GoUp_ShadeCount < GOUP_SHADE_CONFIRM_COUNT)
+                {
+                    GoUp_ShadeCount++;
+                }
+            }
+            else
+            {
+                GoUp_ShadeCount = 0;
+            }
+
+            if(GoUp_ShadeCount >= GOUP_SHADE_CONFIRM_COUNT)
             {
                 GoUp_Stage = GOUP_TURN;
                 GoUp_StartTime = current_time;
             }
             break;
+
         case GOUP_TURN:
             /*原地掉头*/
             drive_Left_S();

@@ -1,131 +1,32 @@
 #include "robot_fight.h"
-#include "robot_roaming.h"
 #include "motor.h"
 #include "obstacle.h"
 #include "shade.h"
 #include "vision_parser.h"
-#include "usart.h"
 
-static FightState Fight_State = FIGHT_ENGAGE;
-static uint32_t Fight_StartTime = 0;
-static bool Fight_DoneFlag = false;
-static bool Fight_DownFlag = false;
-static uint32_t Fight_EngageLost = 0;
-
-/* 方向消抖: 连续2次相同方向才确认有效 */
-static EnemyDir Fight_PrevRawDir = DIR_NONE;
-static EnemyDir Fight_StableDir  = DIR_NONE;
-
-/* 灰度掉台消抖计数 (阈值定义在 shade.h) */
-static uint8_t Fight_ShadeDownCount = 0;
-
-/* 视觉类型消抖 (远程新增) */
-static char Fight_PrevVisionType = 'X';
-static char Fight_StableVisionType = 'X';
-static uint8_t Fight_VisionTypeCount = 0;
-
-/* 边缘连续计数 */
-static uint8_t Fight_EdgeCount = 0;
-
-/* 后方光电忽略窗口 (F/B掉头后避免立即重新检测) */
-static uint32_t Fight_IgnoreRearUntil = 0;
-
-/* 动作原因追踪 (区分边缘触发 vs F/B触发的不同后续行为) */
-typedef enum {
-    FIGHT_ACTION_NONE = 0,
-    FIGHT_ACTION_EDGE,
-    FIGHT_ACTION_FB
-} FightActionReason;
-static FightActionReason Fight_ActionReason = FIGHT_ACTION_NONE;
-
-/* 视觉追踪PD控制 v2: 死区+转向承诺 */
-#define VISION_DEADZONE       8
-#define VISION_TURN_COMMIT_MS 150
-#define VISION_KP             20
-#define VISION_KD             12
-
-static int8_t prev_vision_dir = 0;
-static int16_t committed_turn = 0;
-static uint32_t turn_commit_time = 0;
-
-/**
- * @description: 视觉精准追踪 v2 (死区+转向承诺+PD增益优化)
- */
-static void Fight_VisionChase(void)
-{
-    int8_t d = vision_target.dir;  // [-100, +100]
-    int16_t base = SPEED_MEDIUM;
-    uint32_t now = HAL_GetTick();
-
-    /* 距离自适应基础速度 (在死区和PD路径之前统一计算) */
-    if(vision_target.area > 15000) base = SPEED_LOW;
-    else if(vision_target.area < 3000) base = SPEED_HIGH;
-
-    /* 死区: 目标基本居中, 直走 */
-    if(d > -VISION_DEADZONE && d < VISION_DEADZONE)
-    {
-        /* 转向承诺有效期内继续上次转向, 避免抖动 */
-        if(now - turn_commit_time < VISION_TURN_COMMIT_MS && committed_turn != 0)
-        {
-            int16_t left  = base + committed_turn;
-            int16_t right = base - committed_turn;
-            if(left > 1000) left = 1000; if(left < -1000) left = -1000;
-            if(right > 1000) right = 1000; if(right < -1000) right = -1000;
-            drive_user_defined(left, right);
-        }
-        else
-        {
-            /* 直走 (base已根据距离自适应) */
-            drive_user_defined(base, base);
-        }
-        prev_vision_dir = d;
-        return;
-    }
-
-    /* PD控制: Kp=2.0, Kd=1.2 */
-    int16_t p_term = (int16_t)((int16_t)d * VISION_KP / 10);
-    int16_t d_term = (int16_t)(((int16_t)d - (int16_t)prev_vision_dir) * VISION_KD / 10);
-    prev_vision_dir = d;
-    int16_t turn = p_term + d_term;
-
-    /* 转向承诺: 防止方向频繁翻转 */
-    if((turn > 0) != (committed_turn > 0) && committed_turn != 0)
-    {
-        if(now - turn_commit_time < VISION_TURN_COMMIT_MS)
-        {
-            turn = committed_turn;
-        }
-        else
-        {
-            committed_turn = turn;
-            turn_commit_time = now;
-        }
-    }
-    else
-    {
-        committed_turn = turn;
-        turn_commit_time = now;
-    }
-
-    /* base已在函数顶部根据距离自适应 */
-
-    int16_t left  = base + turn;
-    int16_t right = base - turn;
-    if(left > 1000) left = 1000; if(left < -1000) left = -1000;
-    if(right > 1000) right = 1000; if(right < -1000) right = -1000;
-    drive_user_defined(left, right);
-}
+static FightState Fight_State = FIGHT_ENGAGE;        // 当前进攻状态机状态
+static uint32_t Fight_StartTime = 0;                 // 当前状态起始时间戳
+static bool Fight_DoneFlag = false;                  // 进攻阶段完成标志（通知总控回漫游）
+static uint32_t Fight_EngageLost = 0;                // 交战态中丢失目标的起始时间
+static EnemyDir Fight_PrevRawDir = DIR_NONE;         // 上一拍原始敌人方向（用于方向消抖）
+static EnemyDir Fight_StableDir  = DIR_NONE;         // 消抖后的稳定敌人方向
+static uint8_t Fight_EdgeCount = 0;                  // 边缘检测确认计数
+static char Fight_PrevVisionType = 'X';              // 上一拍视觉类型（用于视觉类型消抖）
+static char Fight_StableVisionType = 'X';            // 消抖后的稳定视觉类型
+static uint8_t Fight_VisionTypeCount = 0;            // 视觉类型连续命中计数
+static uint8_t Fight_ShadeCount = 0;                 // 灰度掉台确认计数
+static bool Fight_DownFlag = false;                  // 掉台标志（通知总控切BACKUP）
+static EnemyDir Fight_TrackDir = DIR_NONE;           // 侧后追踪当前方向
 
 /*======传感器读取======*/
 
 /**
- * @description: 获取敌人方向 (含后方光电忽略窗口)
+ * @description: 获取敌人方向
+ * @param void
+ * @return EnemyDir
  */
 EnemyDir Fight_GetEnemyDir(void)
 {
-    uint32_t now = HAL_GetTick();
-    uint8_t ignore_rear = (Fight_IgnoreRearUntil != 0 && now < Fight_IgnoreRearUntil);
-
     /*读取八路光电传感器*/
     uint8_t nw    = (HAL_GPIO_ReadPin(FIGHT_IR_NW_PORT,    FIGHT_IR_NW_PIN)    == FIGHT_IR_TRIGGERED);
     uint8_t ne    = (HAL_GPIO_ReadPin(FIGHT_IR_NE_PORT,    FIGHT_IR_NE_PIN)    == FIGHT_IR_TRIGGERED);
@@ -136,16 +37,10 @@ EnemyDir Fight_GetEnemyDir(void)
     uint8_t front = (HAL_GPIO_ReadPin(FIGHT_IR_FRONT_PORT, FIGHT_IR_FRONT_PIN) == FIGHT_IR_TRIGGERED);
     uint8_t back  = (HAL_GPIO_ReadPin(FIGHT_IR_BACK_PORT,  FIGHT_IR_BACK_PIN)  == FIGHT_IR_TRIGGERED);
 
-    /* F/B掉头后忽略后方光电, 避免立即重新检测到刚离开的物体 */
-    if(ignore_rear)
-    {
-        back = 0;
-    }
-
     /*判断敌人方向*/
-    if(front) return DIR_FRONT;
-    if(nw || (nw && front)) return DIR_FRONT_LEFT;
-    if(ne || (ne && front)) return DIR_FRONT_RIGHT;
+    if(front)return DIR_FRONT;
+    if(nw) return DIR_FRONT_LEFT;
+    if(ne) return DIR_FRONT_RIGHT;
     if(l)  return DIR_LEFT;
     if(r)  return DIR_RIGHT;
     if(sw) return DIR_BACK_LEFT;
@@ -156,6 +51,8 @@ EnemyDir Fight_GetEnemyDir(void)
 
 /**
  * @description: 光电边缘检测(一票否决)
+ * @param void
+ * @return bool
  */
 static bool Fight_EdgeDetected(void)
 {
@@ -164,9 +61,29 @@ static bool Fight_EdgeDetected(void)
 }
 
 /**
- * @description: 视觉类型消抖 — 连续N帧相同类型才确认有效
- *   防止视觉闪烁导致误判 (如E→F→E快速跳变)
+ * @description: 检测是否掉台（V0/V1 任一超阈值，连续确认后触发）
+ * @param void
+ * @return bool
  */
+static bool detect_shade(void)
+{
+    site_detect_shade();
+
+    if(voltage_v0 > 2.8f || voltage_v1 > 2.8f)
+    {
+        if(Fight_ShadeCount < FIGHT_SHADE_CONFIRM_COUNT)
+        {
+            Fight_ShadeCount++;
+        }
+    }
+    else
+    {
+        Fight_ShadeCount = 0;
+    }
+
+    return (Fight_ShadeCount >= FIGHT_SHADE_CONFIRM_COUNT);
+}
+
 static char Fight_GetStableVisionType(void)
 {
     if (Vision_IsTimeout() || !vision_target.valid)
@@ -195,74 +112,30 @@ static char Fight_GetStableVisionType(void)
     return Fight_StableVisionType;
 }
 
-/**
- * @description: 掉台检测(灰度传感器 滤波+消抖 + 原始值紧急快速通道)
- *   正常路径: voltage_filtered > 2.85V 连续5次确认 (50ms)
- *   紧急路径: voltage raw > 3.10V 双传感器, 跳过滤波直接确认 (0ms)
- */
-static bool Fight_DetectShade(void)
-{
-    site_detect_shade();
-
-    /* 紧急快速通道: 原始值极高 = 确定掉台, 跳过滤波延迟 */
-    if(voltage[0] > SHADE_RAW_EMERGENCY
-       && voltage[1] > SHADE_RAW_EMERGENCY)
-    {
-        return true;
-    }
-
-    /* 正常路径: 滤波值 + 连续确认 */
-    if(voltage_filtered[0] > SHADE_DOWN_THRESHOLD
-       && voltage_filtered[1] > SHADE_DOWN_THRESHOLD)
-    {
-        Fight_ShadeDownCount++;
-        if(Fight_ShadeDownCount >= SHADE_DOWN_CONFIRM)
-            return true;
-    }
-    else
-    {
-        Fight_ShadeDownCount = 0;
-    }
-    return false;
-}
-
 /*======状态机======*/
 
 void Fight_Init(void)
 {
+    Motor_Ramp_SyncFromCurrent();
     Fight_State = FIGHT_ENGAGE;
     Fight_DoneFlag = false;
-    Fight_DownFlag = false;
     Fight_StartTime = HAL_GetTick();
     Fight_EngageLost = 0;
     Fight_PrevRawDir = DIR_NONE;
-    Fight_StableDir  = DIR_NONE;
-    Fight_ShadeDownCount = 0;
+    Fight_StableDir = DIR_NONE;
+    Fight_EdgeCount = 0;
     Fight_PrevVisionType = 'X';
     Fight_StableVisionType = 'X';
     Fight_VisionTypeCount = 0;
-    Fight_EdgeCount = 0;
-    Fight_IgnoreRearUntil = 0;
-    Fight_ActionReason = FIGHT_ACTION_NONE;
-    prev_vision_dir = 0;
-    committed_turn = 0;
-    turn_commit_time = 0;
+    Fight_ShadeCount = 0;
+    Fight_DownFlag = false;
+    Fight_TrackDir = DIR_NONE;
 }
 
 void Fight_Update(void)
 {
     uint32_t now = HAL_GetTick();
     uint32_t elapsed = now - Fight_StartTime;
-
-    /*======掉台安全: 灰度传感器 滤波+消抖======*/
-    if(Fight_DetectShade())
-    {
-        Fight_DownFlag = true;
-        MOTOR_BrakeAll();
-        return;
-    }
-
-    /* 方向消抖 + 视觉类型消抖 */
     EnemyDir raw_dir = Fight_GetEnemyDir();
     if(raw_dir == Fight_PrevRawDir)
     {
@@ -272,26 +145,37 @@ void Fight_Update(void)
     EnemyDir dir = Fight_StableDir;
     char vision_type = Fight_GetStableVisionType();
 
-    /*======边缘安全: 非RETREAT状态下制动并计数======*/
-    if(Fight_EdgeDetected())
+    /*======掉台安全======*/
+    if(detect_shade())
     {
+        Motor_Ramp_ForceStop();
+        Fight_DownFlag = true;
         MOTOR_BrakeAll();
-        Fight_ShadeDownCount = 0;  /* 边缘期间清掉灰度累计 */
-        Fight_EdgeCount++;
-        if(Fight_State != FIGHT_RETREAT)
+        return;
+    }
+
+    /*======边缘安全：交战/侧后追踪中都做确认，确认后先停顿再撤退======*/
+    if(Fight_State == FIGHT_ENGAGE || Fight_State == FIGHT_TRACK_SPIN ||
+       Fight_State == FIGHT_FORWARD)
+    {
+        if(Fight_EdgeDetected())
         {
+            Fight_EdgeCount++;
             if(Fight_EdgeCount >= 2)
             {
-                Fight_State = FIGHT_RETREAT;
-                Fight_ActionReason = FIGHT_ACTION_EDGE;
+                Motor_Ramp_ForceStop();
+                MOTOR_BrakeAllRelease();
+                Fight_ShadeCount = 0;
+                Fight_State = FIGHT_EDGE_STOP;
                 Fight_StartTime = now;
+                Fight_EdgeCount = 0;
+                return;
             }
-            return;
         }
-    }
-    else
-    {
-        Fight_EdgeCount = 0;
+        else
+        {
+            Fight_EdgeCount = 0;
+        }
     }
 
     switch(Fight_State)
@@ -300,101 +184,118 @@ void Fight_Update(void)
         case FIGHT_ENGAGE:
             if(dir != DIR_NONE)
             {
-                /* 有目标, 清除丢失计时 */
+                /*有目标，清除交战丢失时间*/
                 Fight_EngageLost = 0;
 
-                /* 正面接触后重置交战时间 */
+                /*正面接触后重置交战时间*/
                 if(dir == DIR_FRONT || dir == DIR_FRONT_LEFT || dir == DIR_FRONT_RIGHT)
                 {
                     Fight_StartTime = now;
                 }
 
-                /* 视觉类型消抖后判断: F(友方)/B(炸弹) → 制动+掉头回避 */
-                if(vision_type == 'F' || vision_type == 'B')
-                {
+                /*视觉类型消抖后再判断*/
+                if (vision_type == 'F' || vision_type == 'B') {
+                    Motor_Ramp_ForceStop();
                     MOTOR_BrakeAll();
-                    Fight_ActionReason = FIGHT_ACTION_FB;
-                    Fight_State = FIGHT_TURN;
+                    Fight_State = FIGHT_FB_TURN;
                     Fight_StartTime = now;
                     break;
                 }
 
-                /* 视觉检测到敌方/中立 → PD追踪 */
-                if(vision_type == 'E' || vision_type == 'N')
-                {
-                    Fight_VisionChase();
-                    break;
-                }
-
-                /* 视觉无目标但光电有目标 → 按方向驱动 */
+                /*IR方向追踪：前扇区走Ramp，侧后方直接进原地旋转*/
                 switch(dir)
                 {
-                    case DIR_FRONT:       drive_For_M();   break;
-                    case DIR_FRONT_LEFT:  drive_Left_M();  break;
-                    case DIR_FRONT_RIGHT: drive_Right_M(); break;
-                    case DIR_LEFT:        drive_Left_M();  break;
-                    case DIR_RIGHT:       drive_Right_M(); break;
-                    case DIR_BACK_LEFT:   drive_Left_S();  break;
-                    case DIR_BACK_RIGHT:  drive_Right_S(); break;
-                    case DIR_BACK:        drive_Right_S(); break;
-                    default: break;
+                    case DIR_FRONT:
+                        Motor_Ramp_SetTarget(FIGHT_TRACK_PUSH_SPEED, FIGHT_TRACK_PUSH_SPEED);
+                        Motor_Ramp_Update();
+                        break;
+                    case DIR_FRONT_LEFT:
+                        Motor_Ramp_SetTarget(FIGHT_TRACK_FRONT_INNER_SPEED,
+                                             FIGHT_TRACK_FRONT_OUTER_SPEED);
+                        Motor_Ramp_Update();
+                        break;
+                    case DIR_FRONT_RIGHT:
+                        Motor_Ramp_SetTarget(FIGHT_TRACK_FRONT_OUTER_SPEED,
+                                             FIGHT_TRACK_FRONT_INNER_SPEED);
+                        Motor_Ramp_Update();
+                        break;
+                    case DIR_LEFT:
+                    case DIR_BACK_LEFT:
+                        Motor_Ramp_SyncFromCurrent();
+                        Fight_State = FIGHT_TRACK_SPIN;
+                        Fight_TrackDir = DIR_LEFT;
+                        Fight_EngageLost = 0;
+                        Fight_StartTime = now;
+                        break;
+                    case DIR_RIGHT:
+                    case DIR_BACK_RIGHT:
+                    case DIR_BACK:
+                        Motor_Ramp_SyncFromCurrent();
+                        Fight_State = FIGHT_TRACK_SPIN;
+                        Fight_TrackDir = DIR_RIGHT;
+                        Fight_EngageLost = 0;
+                        Fight_StartTime = now;
+                        break;
+                    default:
+                        break;
                 }
             }
-            else
-            {
-                /* 丢失目标, 开始/继续丢失倒计时 */
+            else{
+                /*丢失目标：保持当前速度继续跑，不立刻减速*/
+                Motor_Ramp_Update();
                 if(Fight_EngageLost == 0)
                 {
                     Fight_EngageLost = now;
                 }
+                /*丢失超时，直接回漫游*/
                 if(now - Fight_EngageLost >= FIGHT_ENGAGE_LOST)
                 {
-                    MOTOR_StopAll();
                     Fight_State = FIGHT_DONE;
-                    Fight_DoneFlag = true;
                 }
             }
 
-            /* 交战超时 */
-            if(elapsed >= FIGHT_ENGAGE_TIMEOUT)
+            /*交战超时,结束：直接交给 DONE 统一停机收尾*/
+            if((now - Fight_StartTime) >= FIGHT_ENGAGE_TIMEOUT)
             {
-                MOTOR_StopAll();
                 Fight_State = FIGHT_DONE;
-                Fight_DoneFlag = true;
+            }
+            break;
+
+        /*======边缘确认后短暂停顿======*/
+        case FIGHT_EDGE_STOP:
+            if(!MOTOR_IsBraking() && elapsed >= FIGHT_EDGE_STOP_TIME)
+            {
+                Fight_State = FIGHT_RETREAT;
+                Fight_StartTime = now;
             }
             break;
 
         /*======撤退状态======*/
         case FIGHT_RETREAT:
-            drive_Back_M();
+            drive_user_defined(-600, -600);
             if(elapsed >= FIGHT_RETREAT_TIME)
             {
-                Fight_ActionReason = FIGHT_ACTION_EDGE;
                 Fight_State = FIGHT_TURN;
                 Fight_StartTime = now;
             }
             break;
 
-        /*======掉头状态======*/
+        /*======边缘恢复掉头状态======*/
         case FIGHT_TURN:
             drive_Left_S();
             if(elapsed >= FIGHT_TURN_TIME)
             {
-                if(Fight_ActionReason == FIGHT_ACTION_FB)
-                {
-                    /* F/B回避: 掉头后短前进, 并忽略后方光电 */
-                    Fight_IgnoreRearUntil = now + FIGHT_FB_REAR_IGNORE_TIME;
-                    Fight_State = FIGHT_FORWARD;
-                    Fight_StartTime = now;
-                }
-                else
-                {
-                    /* 边缘回避: 掉头后结束 */
-                    MOTOR_StopAll();
-                    Fight_State = FIGHT_DONE;
-                    Fight_DoneFlag = true;
-                    Fight_ActionReason = FIGHT_ACTION_NONE;
-                }
+                Fight_State = FIGHT_DONE;
+            }
+            break;
+
+        /*======F/B回避掉头状态======*/
+        case FIGHT_FB_TURN:
+            drive_Left_S();
+            if(elapsed >= FIGHT_TURN_TIME)
+            {
+                Fight_State = FIGHT_FORWARD;
+                Fight_StartTime = now;
             }
             break;
 
@@ -403,12 +304,54 @@ void Fight_Update(void)
             drive_For_M();
             if(elapsed >= FIGHT_FB_FORWARD_TIME)
             {
-                MOTOR_StopAll();
-                Fight_IgnoreRearUntil = 0;
                 Fight_State = FIGHT_DONE;
-                Fight_DoneFlag = true;
-                Fight_ActionReason = FIGHT_ACTION_NONE;
             }
+            break;
+
+        /*======侧后向追踪：直接原地补角，直到前扇区命中======*/
+        case FIGHT_TRACK_SPIN:
+            if(dir == DIR_FRONT || dir == DIR_FRONT_LEFT || dir == DIR_FRONT_RIGHT)
+            {
+                Fight_TrackDir = DIR_NONE;
+                Fight_EngageLost = 0;
+                Motor_Ramp_SyncFromCurrent();
+                Fight_State = FIGHT_ENGAGE;
+                Fight_StartTime = now;
+                break;
+            }
+
+            if(dir == DIR_LEFT || dir == DIR_BACK_LEFT)
+            {
+                Fight_TrackDir = DIR_LEFT;
+                Fight_EngageLost = 0;
+            }
+            else if(dir == DIR_RIGHT || dir == DIR_BACK_RIGHT || dir == DIR_BACK)
+            {
+                Fight_TrackDir = DIR_RIGHT;
+                Fight_EngageLost = 0;
+            }
+            else if(dir == DIR_NONE)
+            {
+                if(Fight_EngageLost == 0)
+                {
+                    Fight_EngageLost = now;
+                }
+                else if((now - Fight_EngageLost) >= FIGHT_ENGAGE_LOST)
+                {
+                    Fight_State = FIGHT_DONE;
+                    break;
+                }
+            }
+
+            if(Fight_TrackDir == DIR_LEFT)
+            {
+                Motor_Ramp_SetTarget(-FIGHT_TRACK_SPIN_SPEED, FIGHT_TRACK_SPIN_SPEED);
+            }
+            else
+            {
+                Motor_Ramp_SetTarget(FIGHT_TRACK_SPIN_SPEED, -FIGHT_TRACK_SPIN_SPEED);
+            }
+            Motor_Ramp_Update();
             break;
 
         /*======完成状态======*/
@@ -417,6 +360,7 @@ void Fight_Update(void)
             Fight_DoneFlag = true;
             break;
     }
+
 }
 
 bool Fight_IsDone(void)

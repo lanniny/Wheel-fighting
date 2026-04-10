@@ -13,41 +13,45 @@
 // MX_ADC2_Init();
 // MX_DMA_Init(); // Do not call init functions at global scope. They are called in main.c
 
-uint16_t shade[2];//adc value
-float voltage[2];//voltage value
-
-#define SHADE_FILTER_SIZE 8
-
-float voltage_filtered[2] = {0.0f};
-static float voltage_history[2][SHADE_FILTER_SIZE] = {{0}};
-static uint8_t shade_history_idx = 0;
+static uint16_t shade_buf[2];
+static uint8_t shade_test_inject_enable = 0;
+static uint16_t shade_test_v0 = 0;
+static uint16_t shade_test_v1 = 0;
+uint16_t shade_v0;//adc value
+uint16_t shade_v1;//adc value
+float voltage_v0;//voltage value
+float voltage_v1;//voltage value
 
 void Shade_Sensor_Init(void)
 {
-    HAL_ADC_Start_DMA(&hadc2,(uint32_t*)shade,2);//start adc2 dma
-
-    /* initialize filter history to safe values (on-platform) */
-    for(int i = 0; i < 2; i++)
-        for(int j = 0; j < SHADE_FILTER_SIZE; j++)
-            voltage_history[i][j] = 0.0f;
-    shade_history_idx = 0;
-    voltage_filtered[0] = 0.0f;
-    voltage_filtered[1] = 0.0f;
+    HAL_ADC_Start_DMA(&hadc2,(uint32_t*)shade_buf,2);//start adc2 dma
 }
 
 void site_detect_shade()
 {
-    for(int i = 0; i < 2; i++)
+    if (shade_test_inject_enable)
     {
-        float raw = (float)(shade[i] * 3.3f) / 4095.0f;
-        voltage[i] = raw;
-
-        /* sliding-window average filter */
-        voltage_history[i][shade_history_idx] = raw;
-        float sum = 0.0f;
-        for(int j = 0; j < SHADE_FILTER_SIZE; j++)
-            sum += voltage_history[i][j];
-        voltage_filtered[i] = sum / SHADE_FILTER_SIZE;
+        shade_v0 = shade_test_v0;
+        shade_v1 = shade_test_v1;
     }
-    shade_history_idx = (shade_history_idx + 1) % SHADE_FILTER_SIZE;
+    else
+    {
+        shade_v0 = shade_buf[0];
+        shade_v1 = shade_buf[1];
+    }
+
+    voltage_v0 = (float)(shade_v0 * 3.3f) / 4095.0f;//convert adc value to voltage value
+    voltage_v1 = (float)(shade_v1 * 3.3f) / 4095.0f;//convert adc value to voltage value
+}
+
+void Shade_TestInject_Enable(uint16_t v0_adc, uint16_t v1_adc)
+{
+    shade_test_inject_enable = 1;
+    shade_test_v0 = v0_adc;
+    shade_test_v1 = v1_adc;
+}
+
+void Shade_TestInject_Disable(void)
+{
+    shade_test_inject_enable = 0;
 }

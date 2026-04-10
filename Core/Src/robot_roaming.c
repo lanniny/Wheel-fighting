@@ -1,54 +1,63 @@
 /*
- * @Description: 机器人漫游控制 — 状态机 + 灰度滤波消抖 + 边缘互斥 + 左右转分别计时
+ * @Author: Xiang xin wang wxinxiang8@gmail.com
+ * @Date: 2026-02-01 14:52:47
+ * @LastEditors: Xiang xin wang wxinxiang8@gmail.com
+ * @LastEditTime: 2026-02-03 14:23:36
+ * @FilePath: \MDK-ARMd:\robot fighting\robot\Core\Src\robot_roaming.c
+ * @Description: 机器人漫游控制，使用状态机实现非阻塞式控制
  */
 #include "robot_roaming.h"
 #include "shade.h"
 #include "obstacle.h"
 #include "motor.h"
 
+
+typedef enum {
+    ROAMING_TURN_DIR_NONE = 0,
+    ROAMING_TURN_DIR_LEFT,
+    ROAMING_TURN_DIR_RIGHT
+} RoamingTurnDir;
+
 static RoamingState Roaming_Stage = ROAMING_FORWARD;
 static uint32_t Roaming_StartTime = 0;
 static bool Roaming_Done = false;
 static RoamingBackReason Roaming_BackReason = BACK_REASON_NONE;
-static uint32_t Roaming_TurnTimeL = ROAMING_TURN_LEFT_TIME;
-static uint32_t Roaming_TurnTimeR = ROAMING_TURN_RIGHT_TIME;
-static uint32_t Roaming_TurnTimeB = ROAMING_BACKAND_TURN_TIME;
+static uint32_t Roaming_TurnDuration = ROAMING_TURN_LEFT_TIME;
 static RoamingBackReason Roaming_PendingBackReason = BACK_REASON_NONE;
-static uint32_t Roaming_BackDebounceStart = 0;
-
-/* 灰度掉台消抖 (阈值定义在 shade.h) */
-static uint8_t Roaming_ShadeDownCount = 0;
+static uint8_t Roaming_EdgeCount = 0;
+static uint8_t Roaming_ShadeCount = 0;
+static RoamingTurnDir Roaming_LastTurnDir = ROAMING_TURN_DIR_NONE;
+static RoamingTurnDir Roaming_BothTurnDir = ROAMING_TURN_DIR_RIGHT;
 
 /**
- * @description: 检测是否掉落擂台
- *   正常路径: 滤波+消抖
- *   紧急路径: 原始值极高, 零延迟确认
+ * @description: 检测是否掉落擂台（V0/V1 任一超阈值判定掉台）
+ * @param void
+ * @return int 1=掉落擂台, 0=在擂台上
  */
 static int detect_shade(void)
 {
-    site_detect_shade();
+    site_detect_shade();//read shade sensor data
 
-    /* 紧急快速通道: 原始值极高 = 确定掉台 */
-    if(voltage[0] > SHADE_RAW_EMERGENCY
-       && voltage[1] > SHADE_RAW_EMERGENCY)
+    if(voltage_v0 > 2.8f || voltage_v1 > 2.8f)
     {
-        return 1;
-    }
-
-    /* 正常路径: 滤波值 + 连续确认 */
-    if(voltage_filtered[0] > SHADE_DOWN_THRESHOLD
-       && voltage_filtered[1] > SHADE_DOWN_THRESHOLD)
-    {
-        Roaming_ShadeDownCount++;
-        return (Roaming_ShadeDownCount >= SHADE_DOWN_CONFIRM) ? 1 : 0;
+        if(Roaming_ShadeCount < ROAMING_SHADE_CONFIRM_COUNT)
+        {
+            Roaming_ShadeCount++;
+        }
     }
     else
     {
-        Roaming_ShadeDownCount = 0;
-        return 0;
+        Roaming_ShadeCount = 0;
     }
+
+    return (Roaming_ShadeCount >= ROAMING_SHADE_CONFIRM_COUNT);
 }
 
+/**
+ * @description: 初始化漫游状态机
+ * @param void
+ * @return void
+ */
 void Roaming_Init(void)
 {
     Shade_Sensor_Init();
@@ -57,8 +66,10 @@ void Roaming_Init(void)
     Roaming_Done = false;
     Roaming_BackReason = BACK_REASON_NONE;
     Roaming_PendingBackReason = BACK_REASON_NONE;
-    Roaming_BackDebounceStart = 0;
-    Roaming_ShadeDownCount = 0;
+    Roaming_EdgeCount = 0;
+    Roaming_ShadeCount = 0;
+    Roaming_LastTurnDir = ROAMING_TURN_DIR_NONE;
+    Roaming_BothTurnDir = ROAMING_TURN_DIR_RIGHT;
 }
 
 /**
@@ -71,7 +82,7 @@ void Roaming_Update(void)
     uint32_t current_time = HAL_GetTick();
     uint32_t elapsed_time = current_time - Roaming_StartTime;
 
-    /* 非前进态下保持灰度掉台保护 */
+    // 非前进态下保持原有灰度掉台保护
     if(Roaming_Stage != ROAMING_FORWARD && detect_shade())
     {
         Roaming_Stage = ROAMING_DONE;
@@ -85,12 +96,8 @@ void Roaming_Update(void)
     switch(Roaming_Stage)
     {
         case ROAMING_FORWARD:
-            drive_For_L();
-
-            /* 先读边缘传感器, 优先处理悬崖 */
+            // 先读边缘传感器，优先处理悬崖
             Obs_Sensor_ReadAll();
-
-            current_reason = BACK_REASON_NONE;
             if(Obs_Data.IR1 == SET && Obs_Data.IR2 == SET)
             {
                 current_reason = BACK_REASON_BOTH;
@@ -107,9 +114,9 @@ void Roaming_Update(void)
             if(current_reason == BACK_REASON_NONE)
             {
                 Roaming_PendingBackReason = BACK_REASON_NONE;
-                Roaming_BackDebounceStart = 0;
+                Roaming_EdgeCount = 0;
 
-                /* 无边缘预警时, 再做灰度掉台判断 */
+                // 无边缘预警时，再做灰度掉台判断
                 if(detect_shade())
                 {
                     Roaming_Stage = ROAMING_DONE;
@@ -117,87 +124,136 @@ void Roaming_Update(void)
                     MOTOR_BrakeAll();
                     break;
                 }
+
+                // 若仍处于边缘预刹车阶段，则先不恢复前进，避免覆盖刹车输出
+                if(MOTOR_IsBraking())
+                {
+                    break;
+                }
+
+                // 仅在无边缘预警且刹车已结束时继续前进
+                drive_For_Roaming();
             }
             else
             {
-                /* 边缘预警期间清掉灰度累计, 避免灰度抢先进入掉台 */
-                Roaming_ShadeDownCount = 0;
-
+                // 边缘预警期间清掉灰度累计，避免灰度抢先进入掉台
+                Roaming_ShadeCount = 0;
                 if(current_reason != Roaming_PendingBackReason)
                 {
                     Roaming_PendingBackReason = current_reason;
-                    Roaming_BackDebounceStart = current_time;
+                    Roaming_EdgeCount = 1;
+                    MOTOR_BrakeAllRelease();
                 }
-                else if((current_time - Roaming_BackDebounceStart) >= ROAMING_EDGE_DEBOUNCE_MS)
+                else
                 {
-                    MOTOR_BrakeAll();
-                    Roaming_BackReason = current_reason;
-                    Roaming_Stage = ROAMING_BACK;
-                    Roaming_StartTime = current_time;
-                    Roaming_PendingBackReason = BACK_REASON_NONE;
-                    Roaming_BackDebounceStart = 0;
+                    Roaming_EdgeCount++;
+                    if(Roaming_EdgeCount >= ROAMING_EDGE_CONFIRM_COUNT)
+                    {
+                        Roaming_BackReason = current_reason;
+                        Roaming_Stage = ROAMING_EDGE_STOP;
+                        Roaming_StartTime = current_time;
+                        Roaming_PendingBackReason = BACK_REASON_NONE;
+                        Roaming_EdgeCount = 0;
+                    }
                 }
             }
             break;
 
-        case ROAMING_BACK:
-            drive_Back_L();
+        case ROAMING_EDGE_STOP:
+            if(!MOTOR_IsBraking() && elapsed_time >= ROAMING_EDGE_STOP_TIME)
+            {
+                Roaming_Stage = ROAMING_BACK;
+                Roaming_StartTime = current_time;
+            }
+            break;
 
+        case ROAMING_BACK:
+            // 后退状态
+            drive_user_defined(-450, -450);
+            
             if(elapsed_time >= ROAMING_BACK_TIME)
             {
-                /* 后退完成, 根据锁存原因决定转向 */
+                // 后退完成，根据触发后退时锁存的原因决定转向
                 if(Roaming_BackReason == BACK_REASON_BOTH)
                 {
                     Roaming_Stage = ROAMING_TURN_BOTH;
-                    Roaming_TurnTimeB = ROAMING_BACKAND_TURN_TIME;
+                    Roaming_TurnDuration = ROAMING_BACKAND_TURN_TIME;
+                    if(Roaming_LastTurnDir == ROAMING_TURN_DIR_RIGHT)
+                    {
+                        Roaming_BothTurnDir = ROAMING_TURN_DIR_LEFT;
+                    }
+                    else
+                    {
+                        Roaming_BothTurnDir = ROAMING_TURN_DIR_RIGHT;
+                    }
+                    Roaming_LastTurnDir = Roaming_BothTurnDir;
                 }
                 else if(Roaming_BackReason == BACK_REASON_LEFT)
                 {
                     Roaming_Stage = ROAMING_TURN_LEFT;
-                    Roaming_TurnTimeL = ROAMING_TURN_LEFT_TIME;
+                    Roaming_TurnDuration = ROAMING_TURN_LEFT_TIME;
+                    Roaming_LastTurnDir = ROAMING_TURN_DIR_LEFT;
                 }
                 else if(Roaming_BackReason == BACK_REASON_RIGHT)
                 {
                     Roaming_Stage = ROAMING_TURN_RIGHT;
-                    Roaming_TurnTimeR = ROAMING_TURN_RIGHT_TIME;
+                    Roaming_TurnDuration = ROAMING_TURN_RIGHT_TIME;
+                    Roaming_LastTurnDir = ROAMING_TURN_DIR_RIGHT;
                 }
                 else
                 {
                     Roaming_Stage = ROAMING_FORWARD;
                 }
                 Roaming_BackReason = BACK_REASON_NONE;
+                
                 Roaming_StartTime = current_time;
             }
             break;
-
+            
         case ROAMING_TURN_LEFT:
-            drive_Left_M();
-            if(elapsed_time >= Roaming_TurnTimeL)
+            // 左转状态
+            drive_user_defined(-400, 400);
+            
+            if(elapsed_time >= Roaming_TurnDuration)
             {
+                // 转向完成，继续前进
                 Roaming_Stage = ROAMING_FORWARD;
                 Roaming_StartTime = current_time;
             }
             break;
-
+            
         case ROAMING_TURN_RIGHT:
-            drive_Right_M();
-            if(elapsed_time >= Roaming_TurnTimeR)
+            // 右转状态
+            drive_user_defined(400, -400);
+            
+            if(elapsed_time >= Roaming_TurnDuration)
             {
+                // 转向完成，继续前进
                 Roaming_Stage = ROAMING_FORWARD;
                 Roaming_StartTime = current_time;
             }
             break;
 
         case ROAMING_TURN_BOTH:
-            drive_Right_M();
-            if(elapsed_time >= Roaming_TurnTimeB)
+            if(Roaming_BothTurnDir == ROAMING_TURN_DIR_LEFT)
             {
+                drive_user_defined(-400, 400);
+            }
+            else
+            {
+                drive_user_defined(400, -400);
+            }
+
+            if(elapsed_time >= Roaming_TurnDuration)
+            {
+                // 转向完成，继续前进
                 Roaming_Stage = ROAMING_FORWARD;
                 Roaming_StartTime = current_time;
             }
             break;
-
+            
         case ROAMING_DONE:
+            // 完成状态（掉落擂台）
             MOTOR_StopAll();
             Roaming_Done = true;
             break;
@@ -214,10 +270,3 @@ bool Roaming_IsDone(void)
     return Roaming_Done;
 }
 
-/**
- * @description: 当前是否处于前进状态 (仅前进时允许切入格斗, 避免边缘回避被打断)
- */
-bool Roaming_IsForward(void)
-{
-    return (Roaming_Stage == ROAMING_FORWARD);
-}
