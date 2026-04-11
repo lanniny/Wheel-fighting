@@ -123,17 +123,6 @@ int main(void)
   MOTOR_StopAll();
   Startup_WaitForTrigger();
   Vision_Init();
-
-  /* 视觉握手: 确认上位机颜色正确后再上台 (10s超时保护) */
-  {
-      uint8_t is_blue = (Current_Team == TEAM_BLUE) ? 1u : 0u;
-      uint8_t hs_ok = Vision_WaitHandshake(is_blue, 10000u);
-      if (!hs_ok) {
-          /* 超时: 视觉可能未就绪, 仍允许上台 (依赖红外传感器) */
-          /* 可在此处点亮LED或OLED提示操作员 */
-      }
-  }
-
   Robot_Control_Init();
   /* USER CODE END 2 */
 

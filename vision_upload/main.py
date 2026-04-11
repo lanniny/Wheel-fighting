@@ -185,7 +185,7 @@ class Camera:
 class VisionSystem:
     def __init__(self, debug=False, calibrate=False, use_uart=True,
                  stream=True, stream_port=8080, tag_backend=None,
-                 handshake=True):
+):
         self.debug = debug
         self.calibrate = calibrate
         self.use_uart = use_uart
@@ -220,9 +220,6 @@ class VisionSystem:
         self._perf_anno = 0.0
         self._perf_stream = 0.0
         self._perf_count = 0
-        # 握手控制
-        self._handshake = handshake and use_uart
-        self._need_rehandshake = False
         # 掉台回复迟滞状态机
         self._drop_sending_G = False    # 当前是否处于发G状态
         self._drop_confirm_count = 0    # G确认帧计数器
@@ -277,14 +274,6 @@ class VisionSystem:
             self._running = False
         signal.signal(signal.SIGTERM, _sigterm_handler)
 
-        # 握手阶段: 等待 STM32 颜色确认
-        if self._handshake:
-            if not self._run_handshake():
-                print('[HANDSHAKE] Aborted (signal)')
-                return
-        else:
-            print('[HANDSHAKE] Skipped (--no-handshake or --no-uart)')
-
         print('Vision system v6 running. Ctrl+C to stop.')
         print(f'Mode    : {"calibrate" if self.calibrate else "debug" if self.debug else "normal"}')
         print(f'Color   : {self.comm.my_color}')
@@ -335,15 +324,6 @@ class VisionSystem:
                 cmd = self.comm.read_command()
                 if cmd:
                     self._handle_command(cmd)
-                    # STM32 重启 → 重新进入握手阶段
-                    if self._need_rehandshake:
-                        self._need_rehandshake = False
-                        print('[HANDSHAKE] STM32 restarted, re-entering handshake...')
-                        det_logger.info('RE-HANDSHAKE triggered by N cmd')
-                        if self._run_handshake():
-                            print('Vision system v6 resumed after re-handshake.')
-                        next_frame = time.perf_counter() + frame_dt
-                        continue  # 握手后重新读帧
 
                 # 3. 掉台回复模式: 黑色(台面)检测
                 if self.comm.drop_recovery:
@@ -807,85 +787,6 @@ class VisionSystem:
             det_logger.info('=== Vision stopped ===')
             print('Vision system stopped.')
 
-    def _run_handshake(self):
-        """启动握手: 等待 STM32 颜色确认, 发送 H 帧直到收到 's' 启动命令。
-
-        流程:
-          1. 等待 STM32 发送颜色字节 ('b'/'y')
-          2. 设置颜色后, 以 10Hz 发送 $H,<code>,0,0,0*CS\\n
-          3. STM32 验证颜色匹配后发 's', 视觉退出握手进入检测循环
-          4. 流媒体实时显示握手状态, 便于操作员确认
-        """
-        color_received = False
-        ack_count = 0
-        handshake_start = time.time()
-
-        color_labels = {'b': 'BLUE', 'y': 'YELLOW'}
-        color_bgrs = {'b': (255, 100, 0), 'y': (0, 230, 255)}
-
-        print('=' * 55)
-        print('  HANDSHAKE: waiting for STM32 color...')
-        print(f'  Default: {color_labels.get(self.comm.my_color, "?")}')
-        print('=' * 55)
-        det_logger.info('HANDSHAKE_START default=%s', self.comm.my_color)
-
-        while self._running:
-            # 读 STM32 命令
-            cmd = self.comm.read_command()
-            if cmd in ('b', 'y'):
-                if not color_received:
-                    print(f'[HANDSHAKE] Color received: {color_labels[cmd]}')
-                    det_logger.info('HANDSHAKE_COLOR %s', cmd)
-                color_received = True
-            elif cmd == 's' and color_received:
-                # STM32 确认启动
-                elapsed = time.time() - handshake_start
-                print(f'[HANDSHAKE] OK! color={self.comm.my_color} '
-                      f'acks={ack_count} time={elapsed:.1f}s')
-                det_logger.info('HANDSHAKE_OK color=%s acks=%d time=%.1fs',
-                                self.comm.my_color, ack_count, elapsed)
-                return True
-
-            # 收到颜色后开始发握手确认帧
-            if color_received:
-                self.comm.send_handshake()
-                ack_count += 1
-
-            # 流媒体: 显示握手状态
-            if self.stream and self._stream_server:
-                frame = self.camera.read()
-                if frame is not None:
-                    annotated = frame.copy()
-                    h, w = frame.shape[:2]
-                    clr = self.comm.my_color
-                    bgr = color_bgrs.get(clr, (0, 255, 0))
-                    label = color_labels.get(clr, '?')
-                    elapsed = time.time() - handshake_start
-
-                    if color_received:
-                        cv2.putText(annotated, f'HANDSHAKE: {label}',
-                                    (w // 2 - 200, h // 2 - 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.3, bgr, 3)
-                        cv2.putText(annotated, f'Sending H frame... ACK #{ack_count}',
-                                    (w // 2 - 180, h // 2 + 20),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    else:
-                        cv2.putText(annotated, 'WAITING FOR STM32...',
-                                    (w // 2 - 200, h // 2 - 20),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-                        cv2.putText(annotated, f'Default: {label}',
-                                    (w // 2 - 80, h // 2 + 20),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2)
-
-                    cv2.putText(annotated, f'{elapsed:.0f}s',
-                                (10, h - 15),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                    _publish_frame(annotated)
-
-            time.sleep(0.05)
-
-        return False  # SIGTERM
-
     def _on_camera_reconnect(self):
         """相机重连回调: 清除 Tracker 旧轨迹 + 重置 EMA"""
         if self.detector._tracker:
@@ -913,12 +814,7 @@ class VisionSystem:
             self.detector.reset_drop_ema()
             self.comm.active = True
             self.comm.drop_recovery = False
-            # STM32 重启 → 需要重新握手确认颜色
-            if self._handshake:
-                self._need_rehandshake = True
-                extra = ' → RE-HANDSHAKE'
-            else:
-                extra = ' → RESET TO NORMAL DETECT'
+            extra = ' → RESET TO NORMAL DETECT'
         elif cmd == 'D':
             self._drop_start_time = time.time()
             self._drop_sending_G = False
@@ -1018,8 +914,6 @@ def main():
     parser.add_argument('--color', choices=['b', 'y'], default='b')
     parser.add_argument('--priority-mode', choices=['collect', 'attack'],
                         default=None)
-    parser.add_argument('--no-handshake', action='store_true',
-                        help='Skip STM32 color handshake')
     parser.add_argument('--no-stream', action='store_true',
                         help='Disable MJPEG stream server')
     parser.add_argument('--stream-port', type=int, default=8080,
@@ -1048,7 +942,6 @@ def main():
         stream=not args.no_stream,
         stream_port=args.stream_port,
         tag_backend=args.tag_backend,
-        handshake=not args.no_handshake,
     )
     vision.comm.my_color = args.color
     vision.comm.mode = args.mode

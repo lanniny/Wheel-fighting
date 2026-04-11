@@ -2,13 +2,13 @@
 UART 通信模块 v3 - 自动重连 + 颜色心跳 + 炸弹类型支持
 
 协议 (LubanCat -> STM32):  $type,cx,cy,area,dir*CS\n
-  type: E=敌方  N=中立  F=友方  X=无目标  B=炸弹  H=握手确认
+  type: E=敌方  N=中立  F=友方  X=无目标  B=炸弹
   cx,cy: 目标中心像素坐标 [0-640 / 0-480]
   area:  目标面积 (像素)
   dir:   方向偏移整数 [-100,+100]  负=左 正=右
   CS:    body 字段的逐字节异或校验和 (十六进制 2位)
   例:   $E,320,240,5000,+25*4A\n
-  握手: $H,1,0,0,0*CS\n  (cx=1蓝方, cx=2黄方)
+
 
 协议 (STM32 -> LubanCat): 单字节指令
   'b' = 己方蓝色      'y' = 己方黄色
@@ -421,34 +421,6 @@ class UartComm:
             self._tx_total = 0
             self._tx_success = 0
             self._stats_timer = now
-
-    # ------------------------------------------------------------------
-    # 握手确认
-    # ------------------------------------------------------------------
-    def send_handshake(self):
-        """发送握手确认帧 $H,<color_code>,0,0,0*CS\\n (绕过活跃状态和频率限制)。
-        color_code: 1=蓝方, 2=黄方。STM32 收到后校验颜色, 匹配则发 's' 启动。
-        """
-        if not self.ser:
-            self._try_reconnect()
-            return
-        now = time.time()
-        if now - self._last_send < 0.1:  # 10Hz
-            return
-        if not self._check_device_alive():
-            self._try_reconnect()
-            return
-        try:
-            color_code = 1 if self.my_color == 'b' else 2
-            body = f'H,{color_code},0,0,0'
-            cs = self._checksum(body)
-            msg = f'${body}*{cs}\n'
-            self.ser.write(msg.encode())
-            self._last_send = now
-        except Exception:
-            self._tx_errors += 1
-            if self._tx_errors >= self._TX_ERROR_THRESHOLD:
-                self._try_reconnect()
 
     # ------------------------------------------------------------------
     # 高层接口
