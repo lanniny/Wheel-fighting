@@ -535,88 +535,78 @@ class VisionSystem:
                         is_tag_scan_frame = (
                             frame_idx % self._tag_interval == 0)
 
-                        if targets and pt:
-                            # 策略A: 有优先颜色目标 → ROI Tag精确分类
+                        # Tag 检测 (ROI + 定期全帧扫描)
+                        if targets:
+                            # 有颜色目标 → ROI Tag 精确分类
                             top_targets = sorted(
                                 targets, key=lambda t: t.area,
                                 reverse=True)[:2]
                             roi_tags = self.tag_detector.detect_tags_in_rois(
                                 frame, top_targets)
-                            # 补充: 全帧扫描发现ROI外的Tag (如白色中立块)
-                            if is_tag_scan_frame:
-                                full_tags = self.tag_detector.detect_tags(frame)
-                                roi_ids = {t.get('id') for t in roi_tags}
-                                for ft in full_tags:
-                                    if ft.get('id') not in roi_ids:
-                                        roi_tags.append(ft)
-                                tags = roi_tags
-                                self._last_tags = tags
-                            elif roi_tags:
-                                # ROI有结果: 合并到缓存
-                                tags = roi_tags + [
-                                    t for t in self._last_tags
-                                    if t.get('id') not in
-                                       {r.get('id') for r in roi_tags}]
-                                self._last_tags = tags
-                            else:
-                                # ROI无结果: 保留上次缓存
-                                tags = self._last_tags
-                            # 匹配: 为优先目标和孤儿Tag分别处理
-                            if tags:
-                                best_match = min(
-                                    tags,
-                                    key=lambda tg: ((tg['cx'] - pt.cx)**2
-                                                    + (tg['cy'] - pt.cy)**2))
-                                d = ((best_match['cx'] - pt.cx)**2
-                                     + (best_match['cy'] - pt.cy)**2)**0.5
-                                if d < match_dist:
-                                    tag_type_override = TagDetector.classify_tag(
-                                        best_match['id'], self.comm.my_color)
-                                # 孤儿Tag: 不匹配任何颜色目标的Tag
-                                # (如白色中立块, 颜色检测不到但Tag能看到)
-                                for tg in tags:
-                                    orphan = True
-                                    for ct in targets:
-                                        od = ((tg['cx'] - ct.cx)**2
-                                              + (tg['cy'] - ct.cy)**2)**0.5
-                                        if od < match_dist:
-                                            orphan = False
-                                            break
-                                    if orphan:
-                                        ot = TagDetector.classify_tag(
-                                            tg['id'], self.comm.my_color)
-                                        if ot in ('E', 'N'):
-                                            tag_standalone = tg
-                                            break  # 取第一个孤儿E/N
                         else:
-                            # 策略B: 无优先颜色目标 → 全帧Tag发现
-                            if is_tag_scan_frame:
-                                tags = self.tag_detector.detect_tags(frame)
-                                self._last_tags = tags
-                            else:
-                                tags = self._last_tags
-                            # Tag独立发现目标 (白色/中立块等)
-                            if tags:
-                                best = max(tags, key=lambda t: t.get('area', 0))
-                                tag_standalone = best
+                            roi_tags = []
+
+                        # 定期全帧扫描: 发现 ROI 外的 Tag
+                        if is_tag_scan_frame:
+                            full_tags = self.tag_detector.detect_tags(frame)
+                            roi_ids = {t.get('id') for t in roi_tags}
+                            for ft in full_tags:
+                                if ft.get('id') not in roi_ids:
+                                    roi_tags.append(ft)
+                            tags = roi_tags
+                            self._last_tags = tags
+                        elif roi_tags:
+                            tags = roi_tags + [
+                                t for t in self._last_tags
+                                if t.get('id') not in
+                                   {r.get('id') for r in roi_tags}]
+                            self._last_tags = tags
+                        else:
+                            tags = self._last_tags
+
+                        # Tag 分类覆盖 (Tag 是最高优先级)
+                        if tags and pt:
+                            # 找与优先目标最近的 Tag
+                            best = min(
+                                tags,
+                                key=lambda tg: ((tg['cx'] - pt.cx)**2
+                                                + (tg['cy'] - pt.cy)**2))
+                            d = ((best['cx'] - pt.cx)**2
+                                 + (best['cy'] - pt.cy)**2) ** 0.5
+                            if d < match_dist:
+                                # Tag 匹配颜色目标 → Tag 分类覆盖颜色分类
+                                tag_type_override = TagDetector.classify_tag(
+                                    best['id'], self.comm.my_color)
+
+                        # 孤儿 Tag: 不匹配任何颜色目标 → 无条件作为独立目标
+                        if tags:
+                            for tg in tags:
+                                orphan = True
+                                for ct in (targets or []):
+                                    od = ((tg['cx'] - ct.cx)**2
+                                          + (tg['cy'] - ct.cy)**2) ** 0.5
+                                    if od < match_dist:
+                                        orphan = False
+                                        break
+                                if orphan:
+                                    tag_standalone = tg
+                                    break  # 最大面积优先 (tags已排序)
 
                 t_det = time.perf_counter()
 
                 # 5. 发送 [计时: uart]
+                # 优先级: Tag分类 > 颜色分类 (Tag是地面真值, 颜色可能误判)
                 if collect_mode:
                     if tags:
                         self._send_tag_target(tags[0])
                     else:
                         self.comm.send_target('X')
-                elif tag_standalone and pt and tag_standalone.get('area', 0) > pt.area * 2:
-                    # 孤儿Tag面积远大于颜色噪声 → Tag目标优先
-                    self._send_tag_target(tag_standalone)
                 elif tag_type_override and pt:
-                    # 颜色+Tag融合: Tag精确分类优先
+                    # Tag+颜色匹配: 用Tag分类 + 颜色位置 (Tag分类更准)
                     self.comm.send_target(tag_type_override,
                                           pt.cx, pt.cy, pt.area, pt.direction)
                 elif tag_standalone:
-                    # Tag独立发现: 颜色未命中但Tag检测到目标
+                    # Tag独立发现: 颜色未命中或不匹配, Tag说了算
                     self._send_tag_target(tag_standalone)
                 elif own_only:
                     self.comm.send_own_detection(own_targets)
