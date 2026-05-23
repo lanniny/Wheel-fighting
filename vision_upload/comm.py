@@ -51,7 +51,7 @@ class UartComm:
         self._last_send = 0.0
         self._last_dir = 0.0         # 上次发送方向 (自适应频率用)
         self._send_interval = 0.050  # 最高 20Hz 发送频率
-        self._no_target_interval = 0.2  # 无目标时降到 5Hz, 节省带宽
+        self._no_target_interval = 0.15  # 无目标时~7Hz (不能>=0.2, 否则触及STM32 200ms超时边界)
         self._fast_interval = 0.033  # 快速运动时 30Hz
         self._tx_errors = 0
         self._rx_errors = 0          # 读取错误计数

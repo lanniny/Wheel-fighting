@@ -155,11 +155,13 @@ class Tracker:
                     tr['confirm_count'] = tr.get('confirm_count', 0) + 1
                     if tr['confirm_count'] >= self.confirm_frames:
                         tr['confirmed'] = True
+                        tr['just_confirmed'] = True
 
-        # 补充已确认但本轮未加入 result 的新确认目标
+        # 补充刚确认的目标 (只在 confirm_count 从 N-1 升到 N 的那一帧触发)
         for tid, tr in self._tracks.items():
-            if tid in used_tracks and tr.get('confirmed') and tr.get('confirm_count', 0) == self.confirm_frames:
-                # 刚确认的目标, 补入 result
+            if (tid in used_tracks and
+                    tr.get('just_confirmed', False)):
+                tr['just_confirmed'] = False
                 for t in targets:
                     if abs(t.cx - tr['cx']) < 30 and abs(t.cy - tr['cy']) < 30:
                         result.append(Target(t.color, tr['cx'], tr['cy'],

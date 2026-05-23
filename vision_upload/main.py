@@ -604,9 +604,10 @@ class VisionSystem:
                         # D2: 边缘区域孤儿 Tag 可能是场外 Tag, 跟踪会导致跑出擂台
                         if tags:
                             edge_m = getattr(config, 'ORPHAN_TAG_EDGE_MARGIN', 60)
+                            orphan_ref = color_targets if color_targets else []
                             for tg in tags:
                                 orphan = True
-                                for ct in (targets or []):
+                                for ct in orphan_ref:
                                     od = ((tg['cx'] - ct.cx)**2
                                           + (tg['cy'] - ct.cy)**2) ** 0.5
                                     if od < match_dist:
@@ -835,11 +836,18 @@ class VisionSystem:
         print(f'[CAMERA] Reconnected, Tracker cleared, WB={config.WB_TEMPERATURE}K')
 
     def _send_tag_target(self, tag):
-        """将 Tag 检测结果分类并发送给 STM32 (消除重复的 classify+direction+send 模式)"""
+        """将 Tag 检测结果分类并发送给 STM32"""
         t_type = TagDetector.classify_tag(tag['id'], self.comm.my_color)
         direction = (tag['cx'] - config.CAMERA_WIDTH / 2) / (config.CAMERA_WIDTH / 2)
-        self.comm.send_target(t_type, tag['cx'], tag['cy'],
-                              tag.get('area', 0), direction)
+        if getattr(config, 'DIRECTION_FLIP', False):
+            direction = -direction
+        area = tag.get('area', 0)
+        if t_type == 'F':
+            min_area = getattr(config, 'FRIEND_ALERT_AREA', 5000)
+            if area < min_area:
+                self.comm.send_target('X')
+                return 'X'
+        self.comm.send_target(t_type, tag['cx'], tag['cy'], area, direction)
         return t_type
 
     def _handle_command(self, cmd):

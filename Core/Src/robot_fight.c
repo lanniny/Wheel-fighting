@@ -339,10 +339,11 @@ void Fight_Update(void)
 
     raw_dir = Fight_GetEnemyDir();
     front_hold_trigger = (Obs_Data.IR4 == OBS_BLOCKED_STATE && Obs_Data.IR11 == OBS_BLOCKED_STATE);
+    vision_type = Fight_GetStableVisionType();
 
-    /* P2: 视觉方向辅助IR — IR盲区时用视觉方向补充 */
+    /* P2: 视觉方向辅助IR — IR盲区时用消抖后视觉方向补充 */
     if(raw_dir == DIR_NONE && !Vision_IsTimeout() && vision_target.valid &&
-       vision_target.type != 'F' && vision_target.type != 'B' && vision_target.type != 'X')
+       vision_type != 'F' && vision_type != 'B' && vision_type != 'X')
     {
         int8_t vdir = vision_target.dir;
         if(vdir < FIGHT_VISION_DIR_LEFT_THRESH) raw_dir = DIR_FRONT_LEFT;
@@ -355,10 +356,8 @@ void Fight_Update(void)
     dir = Fight_StableDir;
     if(dir != DIR_FRONT && Fight_State != FIGHT_FRONT_HOLD)
     {
-        // 离开正前后允许下一次双前遮挡重新进入 1000ms 正前保持。
         Fight_FrontHoldConsumed = false;
     }
-    vision_type = Fight_GetStableVisionType();
     if(Fight_State == FIGHT_ENGAGE)
     {
         Fight_UpdateLastFrontArcDir(now, dir);
@@ -400,6 +399,7 @@ void Fight_Update(void)
     }
 
     /* P1: F类型需检查area — 远距离友方(area<阈值)不触发后退, B类型无条件回避 */
+    /* 排除 TRACK_SPIN/FRONT_HOLD: 正在追敌时不应被己方块打断 */
     if(Fight_State != FIGHT_EDGE_STOP &&
        Fight_State != FIGHT_RETREAT &&
        Fight_State != FIGHT_TURN &&
@@ -408,6 +408,8 @@ void Fight_Update(void)
        Fight_State != FIGHT_FB_TURN &&
        Fight_State != FIGHT_FORWARD &&
        Fight_State != FIGHT_FB_ADVANCE &&
+       Fight_State != FIGHT_TRACK_SPIN &&
+       Fight_State != FIGHT_FRONT_HOLD &&
        Fight_State != FIGHT_DONE)
     {
         if(vision_type == 'B' ||
