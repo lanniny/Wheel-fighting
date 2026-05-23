@@ -32,7 +32,7 @@ void Vision_SendColor(char color);
 
 /**
  * @brief 发送单字节指令给视觉系统
- * @param cmd 指令字符: 'D'=掉台回复模式  'S'=恢复正常检测  等
+ * @param cmd 指令字符；当前主流程只发送 'N'=新一轮开始/主控重启
  */
 void Vision_SendCmd(char cmd);
 

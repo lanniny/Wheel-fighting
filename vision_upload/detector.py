@@ -28,6 +28,8 @@ class Target:
         self.solidity = solidity
         # 相对画面中心的水平偏移, 归一化到 [-1, +1]
         self.direction = (cx - config.CAMERA_WIDTH / 2) / (config.CAMERA_WIDTH / 2)
+        if getattr(config, 'DIRECTION_FLIP', False):
+            self.direction = -self.direction
         # 距离分段: 'near'/'mid'/'far'
         near_th = getattr(config, 'DISTANCE_NEAR', 12000)
         far_th = getattr(config, 'DISTANCE_FAR', 3000)
@@ -49,8 +51,10 @@ class Tracker:
     """帧间平滑跟踪器, 支持速度预测 + 面积约束 + 自适应平滑 + 新目标确认"""
 
     def __init__(self, smoothing=0.15, max_dist=150, max_lost=5,
-                 color_switch_frames=3, enable_prediction=True,
+                 color_switch_frames=None, enable_prediction=True,
                  confirm_frames=2):
+        if color_switch_frames is None:
+            color_switch_frames = getattr(config, 'TRACKER_COLOR_SWITCH_FRAMES', 5)
         self.smoothing = smoothing
         self.max_dist = max_dist
         self.max_lost = max_lost
@@ -192,9 +196,6 @@ class ColorDetector:
         self._v_ema = 128.0
         # 上帧最大目标面积 (用于自适应形态学核)
         self._last_max_area = 0
-        # ROI 预测: 上帧目标 bbox
-        self._last_bboxes = []
-        self._frame_idx = 0
         # 掉台检测 EMA: ratio 和 direction 时间平滑
         self._drop_ratio_ema = 0.0
         self._drop_dir_ema = 0.0
@@ -434,22 +435,47 @@ class ColorDetector:
 
     def detect(self, frame):
         """
-        检测一帧中蓝色和黄色目标 (双色模式)。
-        流程: 预处理 → 蓝色检测 → 蓝色排斥掩码 → 黄色检测 → 近距离回退 → 跟踪平滑
+        检测一帧中目标 (v4: 白色 + 蓝色 + 黄色, 三色模式)。
+
+        v4 改进 (修白色能量块被误判为蓝色 bug, 2026-05-21):
+          - 恢复白色检测 (中立能量块), 之前 detect() 没调用白色
+          - 白色优先扫描 + 排斥膨胀 30px, 防止白色块边缘高光/反光像素被蓝色吸收
+          - 蓝色 ROI 排除白色区域; 黄色 ROI 排除白色 + 蓝色区域
+          - 可通过 DETECT_WHITE=0 关闭白色检测回退到旧 v3 行为
+
+        流程: 预处理 → 白色 → 蓝色(排除白色) → 黄色(排除白+蓝) → 近距离回退 → 跟踪
         """
         hsv = self._preprocess(frame)
 
-        # 蓝色优先检测
-        blue_targets = self._detect_color(hsv, 'blue', config.HSV_BLUE)
+        # ── v4: 白色优先 (中立能量块) ──
+        # 白色块在 HSV 中表现为 V 极高 + S 极低, 但边缘高光像素会"漏"到蓝色
+        # 范围 (H 在低 S 下不稳定), 不优先检测 + 排斥掩码会让白色块被识别为蓝色
+        detect_white = getattr(config, 'DETECT_WHITE', True)
+        if detect_white:
+            white_targets = self._detect_color(hsv, 'white', config.HSV_WHITE)
+            white_excl_dilate = getattr(config, 'WHITE_EXCL_DILATE', 30)
+            white_excl = (self._build_exclusion_mask(
+                hsv.shape[:2], white_targets, dilate_px=white_excl_dilate)
+                if white_targets else None)
+        else:
+            white_targets = []
+            white_excl = None
 
-        # 蓝色区域生成排斥掩码, 防止蓝色反光被误识别为黄色
-        blue_excl = self._build_exclusion_mask(
-            hsv.shape[:2], blue_targets, dilate_px=20)
+        # 蓝色检测 (排除白色区域)
+        blue_targets = self._detect_color(
+            hsv, 'blue', config.HSV_BLUE, exclusion_mask=white_excl)
+
+        # 蓝/白合并掩码, 给黄色检测用 (黄色不能跑到白色或蓝色区域)
+        if white_targets or blue_targets:
+            yellow_excl = self._build_exclusion_mask(
+                hsv.shape[:2], white_targets + blue_targets, dilate_px=20)
+        else:
+            yellow_excl = None
 
         yellow_targets = self._detect_color(
-            hsv, 'yellow', config.HSV_YELLOW, exclusion_mask=blue_excl)
+            hsv, 'yellow', config.HSV_YELLOW, exclusion_mask=yellow_excl)
 
-        all_targets = blue_targets + yellow_targets
+        all_targets = white_targets + blue_targets + yellow_targets
 
         if not all_targets:
             all_targets = self._detect_close_range(hsv)
@@ -482,14 +508,17 @@ class ColorDetector:
         return targets
 
     def classify(self, targets, my_color):
-        """根据己方颜色将目标分类为 friends/enemies (白色已移除)"""
+        """根据己方颜色将目标分类为 friends/enemies/neutrals.
+
+        v4 (2026-05-21): 恢复 neutrals 列表 (白色 = 中立能量块).
+        """
         if my_color == 'b':
             friend_color, enemy_color = 'blue', 'yellow'
         else:
             friend_color, enemy_color = 'yellow', 'blue'
         friends  = [t for t in targets if t.color == friend_color]
         enemies  = [t for t in targets if t.color == enemy_color]
-        neutrals = []  # 白色检测已移除
+        neutrals = [t for t in targets if t.color == 'white']
         return friends, enemies, neutrals
 
     # ------------------------------------------------------------------
@@ -525,9 +554,20 @@ class ColorDetector:
         margin_y = h // 6
         roi = frame[margin_y:h - margin_y, margin_x:w - margin_x]
 
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        v_ch = hsv[:, :, 2]
-        s_ch = hsv[:, :, 1]
+        # 只需 V 和 S 通道, 跳过完整 HSV 转换:
+        # V = max(B,G,R), S = (V-min)/V*255 — 与 OpenCV HSV 公式一致
+        # 省去 H 通道计算和 cvtColor 内部临时分配, 掉台检测场景下足够精确
+        b_ch = roi[:, :, 0].astype(np.uint16)
+        g_ch = roi[:, :, 1].astype(np.uint16)
+        r_ch = roi[:, :, 2].astype(np.uint16)
+        v_ch_16 = np.maximum(np.maximum(b_ch, g_ch), r_ch)
+        min_ch = np.minimum(np.minimum(b_ch, g_ch), r_ch)
+        v_ch = v_ch_16.astype(np.uint8)
+        # S = (V - min) * 255 / V, 避免浮点除法
+        with np.errstate(divide='ignore', invalid='ignore'):
+            s_ch = np.where(v_ch_16 > 0,
+                            ((v_ch_16 - min_ch) * 255 // v_ch_16).astype(np.uint8),
+                            np.uint8(0))
 
         v_mean = float(v_ch.mean())
         v_std = float(v_ch.std())
@@ -813,7 +853,10 @@ class TagDetector:
                     results = self._at.detect(roi)
                 except Exception:
                     continue
+                min_margin = getattr(config, 'TAG_DECISION_MARGIN', 30)
                 for r in results:
+                    if hasattr(r, 'decision_margin') and r.decision_margin < min_margin:
+                        continue
                     cx = int(r.center[0]) + x1
                     cy = int(r.center[1]) + y1
                     pts = r.corners
@@ -877,9 +920,15 @@ class TagDetector:
 
     def _detect_apriltag(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        results = self._at.detect(gray)
+        try:
+            results = self._at.detect(gray)
+        except Exception:
+            return []
         tags = []
+        min_margin = getattr(config, 'TAG_DECISION_MARGIN', 30)
         for r in results:
+            if hasattr(r, 'decision_margin') and r.decision_margin < min_margin:
+                continue
             cx, cy = int(r.center[0]), int(r.center[1])
             pts = r.corners
             w = int(pts[:, 0].max() - pts[:, 0].min())

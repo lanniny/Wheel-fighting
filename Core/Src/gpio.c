@@ -60,6 +60,12 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : IR11_Pin IR12_Pin IR13_Pin */
+  GPIO_InitStruct.Pin = IR11_Pin|IR12_Pin|IR13_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
   /*Configure GPIO pins : IR_9_Pin IR_10_Pin */
   GPIO_InitStruct.Pin = IR_9_Pin|IR_10_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;

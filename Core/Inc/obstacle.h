@@ -3,6 +3,9 @@
 
 #include "main.h"
 
+#define OBS_EDGE_TRIGGERED_STATE GPIO_PIN_SET
+#define OBS_BLOCKED_STATE GPIO_PIN_RESET
+
 // 定义传感器数据结构体
 typedef struct {
     GPIO_PinState IR1; // 传感器1状态 (0或1)
@@ -15,7 +18,10 @@ typedef struct {
     GPIO_PinState IR8; // 传感器8状态
     GPIO_PinState IR9; // 传感器9状态
     GPIO_PinState IR10; // 传感器10状态
-    
+    GPIO_PinState IR11; // 前方光电
+    GPIO_PinState IR12; // 右后边缘光电
+    GPIO_PinState IR13; // 左后边缘光电
+
     // 如果需要，可以添加组合状态，例如:
     // uint8_t AllStatus; // 8位位掩码，每一位代表一个传感器
 }Obs_Sensors_t;

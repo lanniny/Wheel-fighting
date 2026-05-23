@@ -4,40 +4,48 @@
 #include "main.h"
 #include <stdbool.h>
 
-/*======引脚配置======*/
-#define FIGHT_IR_NW_PIN IR_3_Pin //左前角
-#define FIGHT_IR_NW_PORT      IR_3_GPIO_Port
-#define FIGHT_IR_NE_PIN IR_5_Pin //右前角
-#define FIGHT_IR_NE_PORT      IR_5_GPIO_Port
-#define FIGHT_IR_L_PIN IR_10_Pin //左侧角
-#define FIGHT_IR_L_PORT       IR_10_GPIO_Port
-#define FIGHT_IR_R_PIN IR_6_Pin //右侧角
-#define FIGHT_IR_R_PORT       IR_6_GPIO_Port
-#define FIGHT_IR_SW_PIN IR_9_Pin //左后角
-#define FIGHT_IR_SW_PORT      IR_9_GPIO_Port
-#define FIGHT_IR_SE_PIN IR_7_Pin //右后角
-#define FIGHT_IR_SE_PORT      IR_7_GPIO_Port
-#define FIGHT_IR_FRONT_PIN    IR_4_Pin //正前方
-#define FIGHT_IR_FRONT_PORT   IR_4_GPIO_Port
-#define FIGHT_IR_BACK_PIN     IR_8_Pin //正后方
-#define FIGHT_IR_BACK_PORT    IR_8_GPIO_Port
-
-/*======触发电平======*/
-#define FIGHT_IR_TRIGGERED GPIO_PIN_RESET   
-
 /*======时间参数(ms)======*/
 #define FIGHT_ENGAGE_TIMEOUT 3000 //交战时间
-#define FIGHT_ENGAGE_LOST 500 //交战丢失时间
+#define FIGHT_ENGAGE_LOST 300 //交战丢失时间
 #define FIGHT_EDGE_STOP_TIME 15 //边缘确认后停顿时间
-#define FIGHT_RETREAT_TIME 400 //撤退时间
-#define FIGHT_TURN_TIME   550 //掉头时间(180°)
-#define FIGHT_FB_FORWARD_TIME 1200 //F/B回避后前进时间
-#define FIGHT_TRACK_FRONT_INNER_SPEED 40 //前侧方追踪内侧轮速度
-#define FIGHT_TRACK_FRONT_OUTER_SPEED 600 //前侧方追踪外侧轮速度
-#define FIGHT_TRACK_PUSH_SPEED 500 //正前推进速度
-#define FIGHT_TRACK_SPIN_SPEED 650 //补角转向速度
+#define FIGHT_FRONT_HOLD_TIME 300U //IR4+IR11双遮挡后正前直推保持时间
+#define FIGHT_REAR_EDGE_CONFIRM_COUNT 2 //后方边缘连续确认次数
+#define FIGHT_REAR_ESCAPE_TIME 300 //后方边缘触发后的前进脱离时间
+#define FIGHT_REAR_ESCAPE_SPEED 450 //后方边缘前进脱离速度
+#define FIGHT_RETREAT_TIME 550 //前边缘直退时间
+#define FIGHT_RETREAT_SOFT_TIME 250 //前边缘初段中速后退时间
+#define FIGHT_RETREAT_SOFT_SPEED 250 //前边缘初段中速后退速度
+#define FIGHT_RETREAT_SPEED 430 //前边缘后退基础速度
+#define FIGHT_EDGE_RETREAT_DIFF 100 //单侧前边缘小弧后退时的左右轮差速
+#define FIGHT_TURN_TIME   550 //普通掉头时间(180°)
+#define FIGHT_EDGE_TURN_TIME 320 //单侧边缘逃逸后的短转时间
+#define FIGHT_EDGE_ARC_MEMORY_MS 800U //双前边缘逃逸可参考的最近前侧方弧追记忆时间
+#define FIGHT_TURN_SPEED 500 //原地转向速度
+#define FIGHT_FB_RETREAT_TIME 500 //F/B回避先后退时间
+#define FIGHT_FB_RETREAT_SPEED 320
+#define FIGHT_FB_FORWARD_TIME 700 //F/B回避后前进时间
+#define FIGHT_FB_ADVANCE_SPEED 350
+#define FIGHT_TRACK_FRONT_ARC_INNER_SPEED -100//前侧方甩头内侧轮速度
+#define FIGHT_TRACK_FRONT_ARC_OUTER_SPEED 550 //前侧方甩头外侧轮速度
+#define FIGHT_TRACK_FRONT_SMALL_ARC_INNER_SPEED 400 //前方小弧线内侧轮速度
+#define FIGHT_TRACK_FRONT_SMALL_ARC_OUTER_SPEED 550 //前方小弧线外侧轮速度
+#define FIGHT_TRACK_PUSH_SPEED 520 //正前推进速度
+#define FIGHT_TRACK_SIDE_ARC_BACK_SPEED 200 //正侧方甩头内侧反转速度
+#define FIGHT_TRACK_SIDE_ARC_FORWARD_SPEED 600 //正侧方甩头外侧前进速度
+#define FIGHT_TRACK_REAR_ARC_BACK_SPEED 300 //后侧方甩头内侧反转速度
+#define FIGHT_TRACK_REAR_ARC_FORWARD_SPEED 700 //后侧方甩头外侧前进速度
 #define FIGHT_VISION_CONFIRM_COUNT 2 //视觉类型消抖次数
-#define FIGHT_SHADE_CONFIRM_COUNT 3 //V0/V1灰度掉台确认次数
+#define FIGHT_SHADE_CONFIRM_TIME 100U //V0/V1灰度掉台持续确认时间
+
+/* P1: 视觉距离融合 — 友方面积阈值 */
+#define FIGHT_FRIEND_MIN_AREA 5000 //友方最小面积: area<此值时忽略F(远距离友方不后退)
+
+/* P2: 视觉方向辅助IR — 方向阈值 */
+#define FIGHT_VISION_DIR_LEFT_THRESH  (-30) //视觉方向<此值判定前左
+#define FIGHT_VISION_DIR_RIGHT_THRESH  (30) //视觉方向>此值判定前右
+
+/* P3: 视觉引导攻击 — 漫游阶段视觉触发攻击的最小面积 */
+#define FIGHT_VISION_ATTACK_MIN_AREA 3000 //视觉area>此值才从漫游进攻击
 
 /*======敌人（能量块）方向======*/
 typedef enum{
@@ -45,6 +53,8 @@ typedef enum{
     DIR_FRONT, //正前方
     DIR_FRONT_LEFT, //左前方
     DIR_FRONT_RIGHT, //右前方
+    DIR_FRONT_SLIGHT_LEFT, //左前小偏
+    DIR_FRONT_SLIGHT_RIGHT, //右前小偏
     DIR_LEFT, //正左
     DIR_RIGHT, //正右
     DIR_BACK_LEFT, //左后方
@@ -54,18 +64,23 @@ typedef enum{
 
 /*======进攻状态======*/
 typedef enum{
-    FIGHT_ENGAGE, //交战
-    FIGHT_EDGE_STOP, //边缘确认后短暂停顿
-    FIGHT_RETREAT, //边缘后退脱离
-    FIGHT_TURN,   //边缘恢复掉头180°
-    FIGHT_FB_TURN, //F/B回避掉头180°
-    FIGHT_FORWARD, //F/B回避后短前进
-    FIGHT_TRACK_SPIN, //侧后向追踪原地补角
+    FIGHT_ENGAGE, //交战主状态：按IR方向推进、弧追或转入侧后甩头
+    FIGHT_FRONT_HOLD, //IR4+IR11正前双遮挡后的定时直推保持
+    FIGHT_EDGE_STOP, //前边缘触发后短暂停顿，等待制动结束
+    FIGHT_REAR_EDGE_STOP, //后边缘触发后短暂停顿，等待制动结束
+    FIGHT_REAR_ESCAPE, //后边缘触发后的前进脱离
+    FIGHT_RETREAT, //前边缘后退脱离
+    FIGHT_TURN,   //前边缘后退后的恢复转向
+    FIGHT_FB_TURN, //F/B回避先后退
+    FIGHT_FORWARD, //F/B回避后180°掉头
+    FIGHT_FB_ADVANCE, //F/B回避后短前进
+    FIGHT_TRACK_SPIN, //左右侧/后侧目标的甩头追踪
     FIGHT_DONE, //交还控制权回漫游
 }FightState;
 
 /* ============ 函数声明 ============ */
 void     Fight_Init(void);
+void     Fight_InitWithDir(EnemyDir dir);
 void     Fight_Update(void);
 bool     Fight_IsDone(void);
 EnemyDir Fight_GetEnemyDir(void);       // 获取敌人方向

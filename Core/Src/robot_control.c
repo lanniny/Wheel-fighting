@@ -17,7 +17,6 @@ static void Robot_Control_EnterRoaming(void)
 static void Robot_Control_EnterBackup(void)
 {
     MOTOR_BrakeAll();
-    Vision_SendCmd('D');
     Backup_Init();
     robot_state = ROBOT_BACKUP;
 }
@@ -28,8 +27,15 @@ void Robot_Control_Init(void)
     robot_state = ROBOT_GO_UP;
 }
 
+RobotState Robot_Control_GetState(void)
+{
+    return robot_state;
+}
+
 void Robot_Control_Update(void)
 {
+    EnemyDir enemy_dir;
+
     switch (robot_state)
     {
         case ROBOT_GO_UP:
@@ -47,9 +53,25 @@ void Robot_Control_Update(void)
                 Robot_Control_EnterBackup();
                 break;
             }
-            if (Fight_GetEnemyDir() != DIR_NONE)
+            enemy_dir = Fight_GetEnemyDir();
+            if (enemy_dir != DIR_NONE)
             {
-                Fight_Init();
+                Fight_InitWithDir(enemy_dir);
+                robot_state = ROBOT_ATTACK;
+            }
+            /* P3: 视觉引导攻击 — IR没触发但视觉看到敌方/中立目标且足够近 */
+            else if (!Vision_IsTimeout() && vision_target.valid &&
+                     (vision_target.type == 'E' || vision_target.type == 'N') &&
+                     vision_target.area > FIGHT_VISION_ATTACK_MIN_AREA)
+            {
+                EnemyDir vdir;
+                if (vision_target.dir < FIGHT_VISION_DIR_LEFT_THRESH)
+                    vdir = DIR_FRONT_LEFT;
+                else if (vision_target.dir > FIGHT_VISION_DIR_RIGHT_THRESH)
+                    vdir = DIR_FRONT_RIGHT;
+                else
+                    vdir = DIR_FRONT;
+                Fight_InitWithDir(vdir);
                 robot_state = ROBOT_ATTACK;
             }
             break;
@@ -72,7 +94,6 @@ void Robot_Control_Update(void)
             Backup_Update();
             if (Backup_IsDone())
             {
-                Vision_SendCmd('S');
                 robot_state = ROBOT_ROAMING;
             }
             break;

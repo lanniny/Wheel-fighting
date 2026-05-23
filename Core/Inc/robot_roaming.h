@@ -20,6 +20,8 @@ typedef enum{
     ROAMING_TURN_LEFT,    // 左转状态
     ROAMING_TURN_RIGHT,   // 右转状态
     ROAMING_TURN_BOTH,    // 后退并转向状态
+    ROAMING_REAR_EDGE_STOP,
+    ROAMING_REAR_ESCAPE,
     ROAMING_DONE          // 完成状态（掉落擂台）
 }RoamingState;
 
@@ -33,11 +35,19 @@ typedef enum {
 
 /*======时间参数======*/
 #define ROAMING_BACK_TIME  550   // 后退时间
+#define ROAMING_BACK_SOFT_TIME 250 // 初段中速后退时间
+#define ROAMING_BACK_SOFT_SPEED 250 // 初段中速后退速度
 #define ROAMING_BACKAND_TURN_TIME  600   // 后退并转向时间
-#define ROAMING_TURN_LEFT_TIME  380   // 左转时间
-#define ROAMING_TURN_RIGHT_TIME  460   // 右转时间
-#define ROAMING_EDGE_CONFIRM_COUNT 1 // 边缘光电消抖次数
+#define ROAMING_TURN_LEFT_TIME  420   // 左转时间
+#define ROAMING_TURN_RIGHT_TIME  470   // 右转时间
+#define ROAMING_REPEAT_TURN_BONUS_TIME  120 // 同侧短期重复触边时额外补偿转向时间
+#define ROAMING_EDGE_CONFIRM_COUNT 2// 边缘光电消抖次数
 #define ROAMING_EDGE_STOP_TIME 15 // 边缘确认后停顿时间
+#define ROAMING_FORWARD_SPEED 350
+#define ROAMING_BACK_SPEED 430
+#define ROAMING_TURN_SPEED 350
+#define ROAMING_REAR_ESCAPE_TIME 300
+#define ROAMING_REAR_ESCAPE_SPEED 450
 #define ROAMING_SHADE_CONFIRM_COUNT 3 // V0/V1灰度掉台确认次数
 
 void Roaming_Init(void);

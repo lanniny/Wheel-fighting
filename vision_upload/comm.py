@@ -1,14 +1,20 @@
 """
-UART 通信模块 v3 - 自动重连 + 颜色心跳 + 炸弹类型支持
+UART 通信模块 v4 - 自动重连 + 颜色心跳 + 炸弹类型支持 + 协议 v2 兼容
 
-协议 (LubanCat -> STM32):  $type,cx,cy,area,dir*CS\n
-  type: E=敌方  N=中立  F=友方  X=无目标  B=炸弹
+协议 v1 (LubanCat -> STM32): $type,cx,cy,area,dir*CS\n
+  type: E=敌方  N=中立  F=友方  X=无目标  B=炸弹  G=冲台
   cx,cy: 目标中心像素坐标 [0-640 / 0-480]
   area:  目标面积 (像素)
   dir:   方向偏移整数 [-100,+100]  负=左 正=右
   CS:    body 字段的逐字节异或校验和 (十六进制 2位)
-  例:   $E,320,240,5000,+25*4A\n
+  例:    $E,320,240,5000,+25*4A\n
 
+协议 v2 (LubanCat -> STM32): $type,cx,cy,area,dir,ts,conf,tid*CS\n
+  ts:    LubanCat HAL_GetTick() 等价时间戳 (ms, 0~65535 滚动)
+  conf:  置信度 [0-100] (NPU 输出 score×100; HSV 检测填 50)
+  tid:   目标轨迹 ID (Tracker 给的稳定 ID, 0 = 未跟踪)
+  v2 STM32 端会忽略多余字段; v1 STM32 端会按 v1 解析多余字段被丢弃 (兼容)。
+  默认禁用 v2; 设 config.PROTOCOL_V2 = True 启用。
 
 协议 (STM32 -> LubanCat): 单字节指令
   'b' = 己方蓝色      'y' = 己方黄色
@@ -19,6 +25,7 @@ UART 通信模块 v3 - 自动重连 + 颜色心跳 + 炸弹类型支持
   'N' = STM32正常重启  (视觉重置为正常识别状态)
 """
 import os
+import errno
 import time
 import config
 
@@ -42,6 +49,7 @@ class UartComm:
         self.drop_recovery = False   # 掉台回复模式 (黑色检测)
         self._color_changed = False  # 颜色切换标志, 供主循环检测并切换WB
         self._last_send = 0.0
+        self._last_dir = 0.0         # 上次发送方向 (自适应频率用)
         self._send_interval = 0.050  # 最高 20Hz 发送频率
         self._no_target_interval = 0.2  # 无目标时降到 5Hz, 节省带宽
         self._fast_interval = 0.033  # 快速运动时 30Hz
@@ -57,10 +65,8 @@ class UartComm:
         self._tx_success = 0
         self._stats_timer = 0.0
         self._STATS_INTERVAL = 60.0
-        # 方向平滑: 滑动窗口
-        self._dir_window = []
-        self._dir_smooth_size = getattr(
-            __import__('config'), 'DIRECTION_SMOOTH_WINDOW', 3)
+        # 方向平滑: 已由 Tracker EMA 处理, comm 层不再二次平滑
+        # (双重平滑会增加方向响应延迟, 导致机器人追踪滞后)
         # RX 缓冲区: 累积接收数据, 分离回声帧和单字节命令
         self._rx_buf = b''
         # 回声确认: STM32 回传的最近一帧
@@ -93,10 +99,22 @@ class UartComm:
             real_port = os.path.realpath(port) if os.path.islink(port) else port
             try:
                 import subprocess
-                subprocess.run(['stty', '-F', real_port, 'low_latency'],
-                               capture_output=True, timeout=2)
-            except Exception:
-                pass
+                result = subprocess.run(
+                    ['stty', '-F', real_port, 'low_latency'],
+                    capture_output=True, timeout=2, text=True)
+                if result.returncode != 0:
+                    # v2 (C3): 不再静默失败, 给主人看到提示
+                    err_msg = (result.stderr or '').strip() or 'unknown'
+                    print(f'[UART] WARN stty low_latency failed ({err_msg}); '
+                          f'kernel buffer 延迟可能偏高 ({real_port})', flush=True)
+            except FileNotFoundError:
+                print(f'[UART] WARN stty 命令不可用, low_latency 未启用 '
+                      f'({real_port})', flush=True)
+            except subprocess.TimeoutExpired:
+                print(f'[UART] WARN stty -F {real_port} 超时 (2s), '
+                      f'low_latency 未确认', flush=True)
+            except Exception as e:
+                print(f'[UART] WARN stty 异常: {e!r}', flush=True)
             # 清空残留数据 (USB 断联重连后可能有脏数据)
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
@@ -237,31 +255,42 @@ class UartComm:
             pass
 
     # ------------------------------------------------------------------
-    # 读指令 (v2: 分离回声帧 + 单字节命令)
+    # 读指令 (v3: 累积所有命令 + 分离回声帧)
     # ------------------------------------------------------------------
     def read_command(self):
         """非阻塞读取 STM32 数据, 分离回声帧和单字节命令。
 
         RX 缓冲区中混合了:
-          - 单字节命令: 'b','y','s','p','c','f','D'
+          - 单字节命令: 'b','y','s','p','c','f','D','N','S'
           - 回声帧: $type,cx,cy,area,dir*CS\\n (STM32原样回传)
 
         策略: 用 '$' 和 '\\n' 定界回声帧, 帧外散字节扫描命令。
-        返回最后一条有效命令字符, 或 None。
+        返回**最后一条**有效命令字符, 或 None。
+        如需获取本轮全部命令, 调用方应使用 `read_commands()`。
         """
+        cmds = self.read_commands()
+        return cmds[-1] if cmds else None
+
+    def read_commands(self):
+        """v3: 返回本轮接收到的**所有**单字节命令 (按顺序)。
+
+        修复 vision-code-review.md B3: 旧版 read_command 在多个命令同时到达时
+        只返回最后一个 (例如 'D'+'b' 同帧, 掉台模式不会被触发)。
+        """
+        commands = []
+
         if not self.ser:
             self._try_reconnect()
-            return None
+            return commands
 
         if not self._check_device_alive():
             self._try_reconnect()
-            return None
+            return commands
 
         try:
             if self.ser.in_waiting <= 0:
-                # 即使没新数据, 也处理残余缓冲
                 if not self._rx_buf:
-                    return None
+                    return commands
             else:
                 data = self.ser.read(self.ser.in_waiting)
                 self._rx_errors = 0
@@ -272,15 +301,14 @@ class UartComm:
                 print(f'[UART] RX error #{self._rx_errors}: {e}, reconnecting')
                 self._try_reconnect()
                 self._rx_errors = 0
-            return None
+            return commands
         except Exception:
-            return None
+            return commands
 
         # 防止缓冲区溢出 (丢弃旧数据)
         if len(self._rx_buf) > 1024:
             self._rx_buf = self._rx_buf[-512:]
 
-        cmd = None
         new_buf = b''
         buf = self._rx_buf
         pos = 0
@@ -289,27 +317,22 @@ class UartComm:
             dollar = buf.find(b'$', pos)
 
             if dollar < 0:
-                # 无帧头: 剩余全是散字节, 扫描命令
                 for i in range(pos, len(buf)):
                     c = self._parse_cmd_byte(chr(buf[i]))
                     if c:
-                        cmd = c
+                        commands.append(c)
                 break
 
-            # '$' 前的散字节: 扫描命令
             for i in range(pos, dollar):
                 c = self._parse_cmd_byte(chr(buf[i]))
                 if c:
-                    cmd = c
+                    commands.append(c)
 
-            # 从 '$' 开始找 '\n' (帧结尾)
             newline = buf.find(b'\n', dollar)
             if newline < 0:
-                # 帧不完整, 保留到下次
                 new_buf = buf[dollar:]
                 break
 
-            # 提取完整帧并解析回声
             frame = buf[dollar:newline + 1]
             if self._echo_enabled:
                 self._parse_echo_frame(frame)
@@ -317,7 +340,7 @@ class UartComm:
             pos = newline + 1
 
         self._rx_buf = new_buf
-        return cmd
+        return commands
 
     # ------------------------------------------------------------------
     # 回声状态查询
@@ -345,34 +368,57 @@ class UartComm:
             return True  # 还没收到过回声, 不判定
         return self.echo_age < self._echo_timeout
 
+    @property
+    def echo_enabled(self):
+        """回声功能是否启用"""
+        return self._echo_enabled
+
+    @property
+    def echo_count(self):
+        """累计收到的回声帧数"""
+        return self._echo_count
+
+    @property
+    def echo_latency_ms(self):
+        """最近一次回声往返延迟(ms)"""
+        return self._echo_latency
+
+    @property
+    def tx_errors(self):
+        """当前连续发送错误计数"""
+        return self._tx_errors
+
+    def force_send_now(self):
+        """强制下一次 send_target 立即发送 (跳过频率限制)。
+        同时重置 _last_tx_ts 防止 echo 健康判定误报。
+        """
+        self._last_send = 0.0
+        self._last_tx_ts = 0.0
+
     # ------------------------------------------------------------------
     # 发送目标
     # ------------------------------------------------------------------
-    def send_target(self, target_type: str, cx=0, cy=0, area=0, direction=0.0):
+    def send_target(self, target_type: str, cx=0, cy=0, area=0, direction=0.0,
+                    confidence=None, target_id=None):
         """
         发送一帧目标数据给 STM32, 含频率限制、方向平滑和自动重连。
+
+        协议 v2 (config.PROTOCOL_V2 = True 启用):
+          多发 ts,conf,tid 三个字段; STM32 v1/v2 都能消化 (v1 忽略多余字段)。
+
+        confidence: 0~100, None=用默认 50 (HSV 检测无可信度)
+        target_id:  Tracker 提供的稳定 ID, None=0 (未跟踪)
         """
         if not self.active:
             return
-
-        # 方向平滑: 滑动窗口平均
-        if target_type != 'X':
-            self._dir_window.append(direction)
-            if len(self._dir_window) > self._dir_smooth_size:
-                self._dir_window = self._dir_window[-self._dir_smooth_size:]
-            direction = sum(self._dir_window) / len(self._dir_window)
-        else:
-            self._dir_window.clear()
 
         # 自适应发送频率: 目标运动快→30Hz, 慢→20Hz, 无目标→5Hz
         now = time.time()
         if target_type == 'X':
             interval = self._no_target_interval
-        elif len(self._dir_window) >= 2:
-            dir_delta = abs(self._dir_window[-1] - self._dir_window[-2])
-            interval = self._fast_interval if dir_delta > 0.05 else self._send_interval
         else:
-            interval = self._send_interval
+            dir_delta = abs(direction - self._last_dir)
+            interval = self._fast_interval if dir_delta > 0.05 else self._send_interval
 
         if now - self._last_send < interval:
             return
@@ -389,19 +435,33 @@ class UartComm:
                 body = 'X,0,0,0,0'
             else:
                 body = f'{target_type},{cx},{cy},{int(area)},{dir_int:+d}'
+
+            # 协议 v2: 追加 ts,conf,tid (向后兼容, v1 STM32 自动忽略)
+            if getattr(config, 'PROTOCOL_V2', False):
+                ts_ms = int((now * 1000) % 65536)
+                conf = 50 if confidence is None else max(0, min(100, int(confidence)))
+                tid = 0 if target_id is None else int(target_id)
+                body = f'{body},{ts_ms},{conf},{tid}'
+
             cs = self._checksum(body)
             msg = f'${body}*{cs}\n'
             self.ser.write(msg.encode())
             self._last_send = now
             self._last_tx_ts = now
+            self._last_dir = direction
             self._tx_errors = 0
             self._tx_success += 1
         except OSError as e:
-            # USB 断开: errno 5/6/19, 立即重连
+            # v2 (C4): USB 断开 → 立即重连, 用 errno 常量替代硬编码
+            #   EIO (5)    : I/O error (设备物理拔出)
+            #   ENXIO (6)  : 无此设备或地址
+            #   ENODEV (19): 设备不存在 (常见于热拔插)
             self._tx_errors += 1
             err_no = getattr(e, 'errno', 0)
-            if err_no in (5, 6, 19):  # EIO, ENXIO, ENODEV
-                print(f'[UART] Device error (errno={err_no}), reconnecting now')
+            device_err_set = (errno.EIO, errno.ENXIO, errno.ENODEV)
+            if err_no in device_err_set:
+                print(f'[UART] Device error (errno={err_no} '
+                      f'{errno.errorcode.get(err_no, "?")}), reconnecting now')
                 self._try_reconnect()
             elif self._tx_errors >= self._TX_ERROR_THRESHOLD:
                 print(f'[UART] TX error #{self._tx_errors}: {e}, reconnecting')
@@ -425,42 +485,24 @@ class UartComm:
     # ------------------------------------------------------------------
     # 高层接口
     # ------------------------------------------------------------------
-    def send_tag(self, tag, my_color='b'):
-        """
-        发送 Tag 检测结果给 STM32 (标准5字段帧)。
-        tag: {'id': int|str, 'cx': int, 'cy': int, 'area': int}
-
-        旧方案 $T,tag_id,cx,cy,area,dir*CS\\n 有6字段,
-        STM32 sscanf 只解析5字段 → 帧被丢弃 (CRITICAL BUG)。
-        修复: 将 tag_id 翻译为标准类型 E/N/F, 用 send_target() 发送。
-        """
-        if not self.active:
-            return
-
-        cx = tag.get('cx', 0)
-        cy = tag.get('cy', 0)
-        area = tag.get('area', 0)
-        direction = (cx - config.CAMERA_WIDTH / 2) / (config.CAMERA_WIDTH / 2)
-        tag_id_raw = tag.get('id', 0)
-        try:
-            tag_id = int(tag_id_raw)
-        except (TypeError, ValueError):
-            print(f'[UART] Drop invalid tag id: {tag_id_raw!r}')
-            return
-
-        # Tag ID → 标准类型: 兼容 STM32 的 5字段解析器
-        from detector import TagDetector
-        t_type = TagDetector.classify_tag(tag_id, my_color)
-        self.send_target(t_type, cx, cy, area, direction)
+    # NOTE (v2, D3): send_tag(self, tag, my_color) 已删除
+    #   原因: 被 main.py:VisionSystem._send_tag_target() 完全取代
+    #   保留的功能等价物在 main.py:803-809 (_send_tag_target)
+    #   删除日期: 2026-05-21, Codex 评审 D3 采纳
 
     def send_own_detection(self, own_targets):
         """
         单色策略: 检测到己方能量块就发 F, 让 STM32 决定是否回避。
         own_targets: detect_own() 返回的目标列表
+        远距离友方 (area < FRIEND_ALERT_AREA) 不发 F, 避免远距离误后退。
         """
         if own_targets:
             t = own_targets[0]
-            self.send_target('F', t.cx, t.cy, t.area, t.direction)
+            min_area = getattr(config, 'FRIEND_ALERT_AREA', 5000)
+            if t.area >= min_area:
+                self.send_target('F', t.cx, t.cy, t.area, t.direction)
+            else:
+                self.send_target('X')
         else:
             self.send_target('X')
 
@@ -494,8 +536,13 @@ class UartComm:
             t = second[0]
             self.send_target(second_type, t.cx, t.cy, t.area, t.direction)
         elif friends:
-            # 双色模式: 友方一律发 F, 让 STM32 根据 area 决定回避力度
+            # 双色模式: 友方 area >= FRIEND_ALERT_AREA 才发 F
+            # 远距离友方不触发后退, 避免机器人因远处己方块误退
             t = friends[0]
-            self.send_target('F', t.cx, t.cy, t.area, t.direction)
+            min_area = getattr(config, 'FRIEND_ALERT_AREA', 5000)
+            if t.area >= min_area:
+                self.send_target('F', t.cx, t.cy, t.area, t.direction)
+            else:
+                self.send_target('X')
         else:
             self.send_target('X')

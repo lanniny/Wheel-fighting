@@ -32,6 +32,7 @@
 #include "shade.h"
 #include "obstacle.h"
 #include "motor.h"
+#include "encoder.h"
 #include "oled.h"
 #include "oled_font.h"
 #include "robot_up.h"
@@ -39,6 +40,7 @@
 #include "robot_backup.h"
 #include "robot_control.h"
 #include "vision_parser.h"
+#include "jy62.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -49,6 +51,14 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define SHADE_OLED_TEST_MODE   0
+#define SHADE_UART_TEST_MODE   0
+#define BACKUP_TEST_MODE       0
+#define IR_OLED_TEST_MODE      0
+#define VISION_OLED_TEST_MODE  0
+#define JY62_TEST_MODE         0
+#define PID_DEBUG_MODE         0
+#define UART_TEST_MODE         0
 
 /* USER CODE END PD */
 
@@ -71,6 +81,139 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#if BACKUP_TEST_MODE
+#define BACKUP_TEST_OFF_STAGE_ADC 3800U
+#define BACKUP_TEST_ON_STAGE_ADC  1000U
+#endif
+
+#if BACKUP_TEST_MODE
+static char Backup_Test_LastNonXType = 'X';
+#endif
+
+#if JY62_TEST_MODE
+#define JY62_TEST_PRINT_MS     100U
+
+static int32_t JY62_Test_Scale100(float value)
+{
+  if (value >= 0.0f)
+  {
+    return (int32_t)(value * 100.0f + 0.5f);
+  }
+
+  return (int32_t)(value * 100.0f - 0.5f);
+}
+
+static void JY62_Test_FormatDecimal(char *buf, uint8_t size, float value)
+{
+  int32_t scaled = JY62_Test_Scale100(value);
+  int32_t whole;
+  int32_t fraction;
+
+  if (scaled < 0)
+  {
+    scaled = -scaled;
+    whole = scaled / 100;
+    fraction = scaled % 100;
+    snprintf(buf, size, "-%ld.%02ld", (long)whole, (long)fraction);
+    return;
+  }
+
+  whole = scaled / 100;
+  fraction = scaled % 100;
+  snprintf(buf, size, "%ld.%02ld", (long)whole, (long)fraction);
+}
+
+static void JY62_Test_Update(void)
+{
+  static uint32_t jy62_test_last_print = 0;
+  uint32_t now = HAL_GetTick();
+
+  JY62_Update();
+
+  if ((now - jy62_test_last_print) >= JY62_TEST_PRINT_MS)
+  {
+    char uart_buf[80] = {0};
+    char roll_buf[12] = {0};
+    char pitch_buf[12] = {0};
+    char yaw_buf[12] = {0};
+    char gz_buf[12] = {0};
+    int len;
+
+    jy62_test_last_print = now;
+    JY62_Test_FormatDecimal(roll_buf, sizeof(roll_buf), jy62_data.roll_deg);
+    JY62_Test_FormatDecimal(pitch_buf, sizeof(pitch_buf), jy62_data.pitch_deg);
+    JY62_Test_FormatDecimal(yaw_buf, sizeof(yaw_buf), jy62_data.yaw_deg);
+    JY62_Test_FormatDecimal(gz_buf, sizeof(gz_buf), jy62_data.gz_dps);
+    len = snprintf(uart_buf, sizeof(uart_buf),
+                   "%s,%s,%s,%s\r\n",
+                   roll_buf,
+                   pitch_buf,
+                   yaw_buf,
+                   gz_buf);
+    if (len > 0)
+    {
+      HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, (uint16_t)len, 100);
+    }
+  }
+}
+#endif
+
+#if PID_DEBUG_MODE
+#define PID_DEBUG_STEP_MS      3000U
+#define PID_DEBUG_PRINT_MS     50U
+
+static int16_t PID_Debug_GetTarget(void)
+{
+  static const int16_t targets[] = {100, 200, 300, 400, 500, 600, 500, 400, 300, 200, 100};
+  static uint32_t pid_debug_start_tick = 0;
+  uint32_t index;
+
+  if (pid_debug_start_tick == 0U)
+  {
+    pid_debug_start_tick = HAL_GetTick();
+  }
+
+  index = (HAL_GetTick() - pid_debug_start_tick) / PID_DEBUG_STEP_MS;
+  if (index >= (sizeof(targets) / sizeof(targets[0])))
+  {
+    index = (sizeof(targets) / sizeof(targets[0])) - 1U;
+  }
+
+  return targets[index];
+}
+
+static void PID_Debug_Update(void)
+{
+  static uint32_t pid_debug_last_print = 0;
+  int16_t target = PID_Debug_GetTarget();
+  uint32_t now = HAL_GetTick();
+
+  drive_user_defined(target, target);
+  Motor_PID_Service();
+
+  if ((now - pid_debug_last_print) >= PID_DEBUG_PRINT_MS)
+  {
+    Motor_DebugStatus_t status;
+    char uart_buf[128] = {0};
+    int len;
+
+    pid_debug_last_print = now;
+    Motor_Debug_GetStatus(&status);
+    len = snprintf(uart_buf, sizeof(uart_buf),
+                   "d:%d,%d,%d,%d,%d,%d\n",
+                   status.target_left,
+                   status.measured_left,
+                   status.output_left,
+                   status.target_right,
+                   status.measured_right,
+                   status.output_right);
+    if (len > 0)
+    {
+      HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, (uint16_t)len, 100);
+    }
+  }
+}
+#endif
 
 /* USER CODE END 0 */
 
@@ -82,6 +225,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+  uint32_t control_last_tick = 0;
 
   /* USER CODE END 1 */
 
@@ -108,22 +252,80 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM4_Init();
   MX_I2C1_Init();
-  MX_I2C2_Init();
   MX_USART2_UART_Init();
   MX_TIM3_Init();
   MX_TIM5_Init();
   MX_TIM8_Init();
   MX_TIM2_Init();
   MX_TIM9_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-
-  Obs_Sensor_Init();
+  
+#if SHADE_OLED_TEST_MODE
+  OLED_Init();
+  OLED_Clear();
+  Shade_Sensor_Init();
+  OLED_ShowString(1, 1, "Gray Sensor Test");
+  OLED_ShowString(2, 1, "A0:---- A1:----");
+  OLED_ShowString(3, 1, "V0: -.---V");
+  OLED_ShowString(4, 1, "V1: -.---V");
+#elif SHADE_UART_TEST_MODE
+  Shade_Sensor_Init();
+#elif BACKUP_TEST_MODE
   MOTOR_Init();
+  ENCODER_Init();
+  ENCODER_ResetAll();
+  Motor_PID_Init();
+  JY62_Init();
+  Backup_Init();
+  MOTOR_StopAll();
+  OLED_Init();
+  OLED_Clear();
+  OLED_ShowString(1, 1, "Wait Team...");
+  Startup_WaitForTrigger();
+  Vision_Init();
+  Vision_SendCmd('N');
+  OLED_Clear();
+  OLED_ShowString(1, 1, "Backup Test");
+  OLED_ShowString(2, 1, "Raw : ");
+  OLED_ShowString(3, 1, "Last: ");
+  OLED_ShowString(4, 1, "Stg : ");
+  Backup_Test_LastNonXType = 'X';
+  Shade_TestInject_Enable(BACKUP_TEST_OFF_STAGE_ADC, BACKUP_TEST_OFF_STAGE_ADC);
+#elif IR_OLED_TEST_MODE
+  /* IR 测试改为串口输出到上位机 */
+#elif VISION_OLED_TEST_MODE
+  OLED_Init();
+  OLED_Clear();
+  OLED_ShowString(1, 1, "Wait Team...");
+  Startup_WaitForTrigger();
+  Vision_Init();
+  OLED_ShowString(1, 1, (Current_Team == TEAM_YELLOW) ? "Vision Y" : "Vision B");
+#elif JY62_TEST_MODE
+  JY62_Init();
+#elif PID_DEBUG_MODE
+  MOTOR_Init();
+  ENCODER_Init();
+  ENCODER_ResetAll();
+  Motor_PID_Init();
+  MOTOR_StopAll();
+#elif UART_TEST_MODE
+  (void)control_last_tick;
+  HAL_UART_Transmit(&huart2, (uint8_t *)"USART2 TEST START\r\n", 19, 100);
+#else
+  MOTOR_Init();
+  ENCODER_Init();
+  ENCODER_ResetAll();
+  Motor_PID_Init();
+  JY62_Init();
   Backup_Init();
   MOTOR_StopAll();
   Startup_WaitForTrigger();
   Vision_Init();
+  JY62_Init();
+  Vision_SendCmd('N');
   Robot_Control_Init();
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -131,8 +333,122 @@ int main(void)
 
   while (1)
   {
-    Robot_Control_Update();
+    MOTOR_Service();
+#if SHADE_OLED_TEST_MODE
+    site_detect_shade();
+
+    uint32_t adc0 = shade_v0;
+    uint32_t adc1 = shade_v1;
+    uint32_t mv0 = (uint32_t)(voltage_v0 * 1000.0f + 0.5f);
+    uint32_t mv1 = (uint32_t)(voltage_v1 * 1000.0f + 0.5f);
+    char line2[17] = {0};
+    char line3[17] = {0};
+    char line4[17] = {0};
+
+    snprintf(line2, sizeof(line2), "A0:%4lu A1:%4lu", adc0, adc1);
+    snprintf(line3, sizeof(line3), "V0:%1lu.%03luV", mv0 / 1000U, mv0 % 1000U);
+    snprintf(line4, sizeof(line4), "V1:%1lu.%03luV", mv1 / 1000U, mv1 % 1000U);
+
+    OLED_ShowString(2, 1, line2);
+    OLED_ShowString(3, 1, line3);
+    OLED_ShowString(4, 1, line4);
+    HAL_Delay(100);
+#elif SHADE_UART_TEST_MODE
+    site_detect_shade();
+
+    uint32_t adc0 = shade_v0;
+    uint32_t adc1 = shade_v1;
+    uint32_t mv0 = (uint32_t)(voltage_v0 * 1000.0f + 0.5f);
+    uint32_t mv1 = (uint32_t)(voltage_v1 * 1000.0f + 0.5f);
+    char uart_buf[96] = {0};
+    int len = snprintf(uart_buf, sizeof(uart_buf),
+                       "A0:%lu,V0:%lumV,A1:%lu,V1:%lumV\r\n",
+                       adc0, mv0, adc1, mv1);
+    if (len > 0)
+    {
+      HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, (uint16_t)len, 100);
+    }
+    HAL_Delay(100);
+#elif BACKUP_TEST_MODE
+    /* 灰度坏了：测试时始终模拟台下，不做上台检测，成功上台后手动停机 */
+    Shade_TestInject_Enable(BACKUP_TEST_OFF_STAGE_ADC, BACKUP_TEST_OFF_STAGE_ADC);
+    Backup_Update();
+    Motor_PID_Service();
+    if (vision_target.type != 'X')
+    {
+      Backup_Test_LastNonXType = vision_target.type;
+    }
+    OLED_ShowChar(2, 7, vision_target.type);
+    OLED_ShowChar(3, 7, Backup_Test_LastNonXType);
+    OLED_ShowNum(4, 7, Backup_DebugGetStage(), 1);
     HAL_Delay(10);
+#elif IR_OLED_TEST_MODE
+    Obs_Sensor_ReadAll();
+
+    char uart_buf[128] = {0};
+    int len = snprintf(uart_buf, sizeof(uart_buf),
+                       "IR1:%d,IR2:%d,IR3:%d,IR4:%d,IR5:%d,IR6:%d,IR7:%d,IR8:%d,IR9:%d,IR10:%d,IR11:%d,IR12:%d,IR13:%d\r\n",
+                       Obs_Data.IR1 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR2 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR3 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR4 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR5 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR6 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR7 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR8 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR9 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR10 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR11 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR12 == GPIO_PIN_SET ? 1 : 0,
+                       Obs_Data.IR13 == GPIO_PIN_SET ? 1 : 0);
+    if (len > 0)
+    {
+      HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, (uint16_t)len, 100);
+    }
+    HAL_Delay(1000);
+#elif VISION_OLED_TEST_MODE
+    {
+      if (Vision_IsTimeout()) {
+        OLED_ShowString(2, 1, "No Data         ");
+        OLED_ShowString(3, 1, "                ");
+        OLED_ShowString(4, 1, "                ");
+      } else {
+        /* 第2行: T:x  dir:+xxx */
+        OLED_ShowString(2, 1, "T:  dir:        ");
+        OLED_ShowChar(2, 3, vision_target.type);
+        OLED_ShowSignedNum(2, 9, vision_target.dir, 3);
+
+        /* 第3行: cx:xxxx cy:xxxx */
+        OLED_ShowString(3, 1, "cx:     cy:     ");
+        OLED_ShowSignedNum(3, 4, vision_target.cx, 4);
+        OLED_ShowSignedNum(3, 12, vision_target.cy, 4);
+
+        /* 第4行: area:xxxxxxx */
+        OLED_ShowString(4, 1, "area:           ");
+        OLED_ShowSignedNum(4, 6, vision_target.area, 7);
+      }
+      HAL_Delay(100);
+    }
+#elif JY62_TEST_MODE
+    JY62_Test_Update();
+    HAL_Delay(10);
+#elif PID_DEBUG_MODE
+    PID_Debug_Update();
+    HAL_Delay(1);
+#elif UART_TEST_MODE
+    HAL_UART_Transmit(&huart2, (uint8_t *)"USART2 OK\r\n", 11, 100);
+    HAL_Delay(2000);
+#else
+    Edge_Sensor_Detect();
+    JY62_Update();
+    uint32_t now = HAL_GetTick();
+    if ((now - control_last_tick) >= 5U)
+    {
+      control_last_tick = now;
+      Robot_Control_Update();
+      Motor_PID_Service();
+    }
+#endif
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

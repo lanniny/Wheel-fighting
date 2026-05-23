@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-轮式格斗机器人 - 视觉主程序 v5
+轮式格斗机器人 - 视觉主程序 v6
 
-v5 改进:
+v6 改进 (vs v5):
+  - STM32 echo 回声确认通道 (echo_confirmed/echo_healthy)
+  - 掉台迟滞状态机 (HIGH/LOW + 确认帧)
+  - 性能分析器 (cap/det/uart/anno/stream 分阶段耗时)
+  - SIGTERM 优雅关闭 (systemd stop)
+  - read_commands() 累积命令处理 (修复多命令丢失)
+  - 协议 v2 兼容 (config.PROTOCOL_V2 开关)
+  - Watchdog: 30s 无有效帧重启相机
   - 内嵌 MJPEG 流媒体服务器 (--stream, 默认开启, 端口8080)
   - 检测日志写入文件 (/tmp/vision_det.log), 滚动保留最近1000行
   - 空间排斥检测 + 白色严格过滤 (detector v2)
@@ -34,7 +41,9 @@ from detector import ColorDetector, TagDetector
 from comm import UartComm
 
 # ============ Detection Logger ============
-LOG_PATH = os.environ.get('VISION_LOG', '/tmp/vision_det.log')
+# B4 收编: 默认值从 config.py 取, env var 仍可覆盖 (systemd Environment=)
+LOG_PATH = os.environ.get(
+    'VISION_LOG', getattr(config, 'LOG_PATH', '/tmp/vision_det.log'))
 
 det_logger = logging.getLogger('det')
 det_logger.setLevel(logging.INFO)
@@ -224,6 +233,18 @@ class VisionSystem:
         self._drop_sending_G = False    # 当前是否处于发G状态
         self._drop_confirm_count = 0    # G确认帧计数器
         self._drop_start_time = 0.0     # 掉台开始时间
+        # v2: 状态输出节流 (替代 \r 单行刷新, 修 journalctl blob data)
+        # 改用换行 print + 时间节流, systemd 能正常显示
+        # B4 收编: 默认值从 config.py 取, env var 仍可覆盖
+        self._last_status_print_ts = 0.0
+        self._status_print_interval = float(
+            os.environ.get(
+                'VISION_STATUS_INTERVAL_S',
+                str(getattr(config, 'STATUS_PRINT_INTERVAL_S', 5.0))))
+        # P1 (2026-05-22): ThermalGuard 占位 (run() 启动时初始化, 需要 detector)
+        self._thermal_guard = None
+        # E1: 上次发送的目标类型 (用于检测 X→非X 切换, 强制立即发送)
+        self._last_sent_type = 'X'
 
     def _update_fps(self):
         self._frame_count += 1
@@ -239,12 +260,12 @@ class VisionSystem:
         roi = hsv[h // 2 - 25:h // 2 + 25, w // 2 - 25:w // 2 + 25]
         hm, sm, vm = roi[:, :, 0].mean(), roi[:, :, 1].mean(), roi[:, :, 2].mean()
         hs, ss, vs = roi[:, :, 0].std(), roi[:, :, 1].std(), roi[:, :, 2].std()
-        sys.stdout.write(
-            f'\rCenter HSV: H={hm:.0f}+-{hs:.0f}  '
-            f'S={sm:.0f}+-{ss:.0f}  '
-            f'V={vm:.0f}+-{vs:.0f}  '
-            f'FPS={self._fps:.1f}   ')
-        sys.stdout.flush()
+        # v2: 时间节流 + 换行输出 (修 journalctl blob)
+        now = time.time()
+        if now - self._last_status_print_ts >= self._status_print_interval:
+            print(f'[CAL] HSV H={hm:.0f}+-{hs:.0f} S={sm:.0f}+-{ss:.0f} '
+                  f'V={vm:.0f}+-{vs:.0f} FPS={self._fps:.1f}', flush=True)
+            self._last_status_print_ts = now
 
     def _async_save_debug(self, frame):
         if self._debug_thread and self._debug_thread.is_alive():
@@ -308,6 +329,9 @@ class VisionSystem:
                 # 1. 读帧 [计时: cap]
                 frame = self.camera.read()
                 t_cap = time.perf_counter()
+                # 2. 先处理 STM32 指令，避免相机异常时串口处理被阻断
+                for cmd in self.comm.read_commands():
+                    self._handle_command(cmd)
                 if frame is None:
                     if time.time() - self._last_valid_frame > self._watchdog_timeout:
                         print(f'\n[WATCHDOG] No valid frame for '
@@ -319,11 +343,6 @@ class VisionSystem:
                     next_frame = time.perf_counter() + frame_dt
                     continue
                 self._last_valid_frame = time.time()
-
-                # 2. 读STM32指令
-                cmd = self.comm.read_command()
-                if cmd:
-                    self._handle_command(cmd)
 
                 # 3. 掉台回复模式: 黑色(台面)检测
                 if self.comm.drop_recovery:
@@ -340,7 +359,7 @@ class VisionSystem:
                         # 否则视觉切回正常模式发 E/N/F 会污染 Backup 类型消抖
                         self._drop_sending_G = False
                         self._drop_confirm_count = 0
-                        self.comm._last_send = 0.0
+                        self.comm.force_send_now()
                         self.comm.send_target('X')
                         self._sleep_until(next_frame)
                         next_frame += frame_dt
@@ -377,7 +396,7 @@ class VisionSystem:
                         # CRITICAL: 掉台等G阶段发X必须≥20Hz(50ms),
                         # 否则默认5Hz(200ms)触及STM32的200ms超时,
                         # 导致Vision_IsTimeout()=1, Backup无法用视觉辅助冲台
-                        self.comm._last_send = 0.0  # 强制本次立即发送
+                        self.comm.force_send_now()  # 强制本次立即发送
                         self.comm.send_target('X')
                     t_uart = time.perf_counter()
 
@@ -387,7 +406,7 @@ class VisionSystem:
 
                     # 回声状态
                     echo_ok = self.comm.echo_confirmed
-                    echo_lag = self.comm._echo_latency
+                    echo_lag = self.comm.echo_latency_ms
 
                     # 日志
                     g_status = 'G' if self._drop_sending_G else 'X'
@@ -414,23 +433,24 @@ class VisionSystem:
                             int(dbg.get('instant_ratio', ratio) * 100),
                             int(th_high * 100), int(th_low * 100),
                             g_status,
-                            self.comm._echo_count, echo_lag,
+                            self.comm.echo_count, echo_lag,
                             drop_elapsed, drop_timeout)
 
-                    # 终端输出
-                    if frame_idx % 10 == 0:
+                    # 终端输出 (v2: 时间节流 + 换行, 修 journalctl blob)
+                    now_print = time.time()
+                    if now_print - self._last_status_print_ts >= self._status_print_interval:
                         status = f'GO[{g_status}]' if self._drop_sending_G else 'wait'
                         echo_str = (f'E:{self.comm.echo_type} {echo_lag:.0f}ms'
                                     if echo_ok else 'E:--')
-                        if not self.comm.echo_healthy and self.comm._echo_count > 0:
+                        if not self.comm.echo_healthy and self.comm.echo_count > 0:
                             echo_str = 'E:LOST!'
-                        sys.stdout.write(
-                            f'\r[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
-                            f'DROP {ratio_pct}% '
-                            f'cfm={self._drop_confirm_count}/{confirm_n} '
-                            f'dir={bdir:+.2f} {status} {echo_str} '
-                            f'[{drop_elapsed:.0f}/{drop_timeout:.0f}s]      ')
-                        sys.stdout.flush()
+                        print(f'[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
+                              f'DROP {ratio_pct}% '
+                              f'cfm={self._drop_confirm_count}/{confirm_n} '
+                              f'dir={bdir:+.2f} {status} {echo_str} '
+                              f'[{drop_elapsed:.0f}/{drop_timeout:.0f}s]',
+                              flush=True)
+                        self._last_status_print_ts = now_print
 
                     # 流媒体: 标注黑色检测结果 (含迟滞状态)
                     if self.stream and self._stream_server and frame_idx % 3 == 0:
@@ -536,10 +556,12 @@ class VisionSystem:
                             frame_idx % self._tag_interval == 0)
 
                         # Tag 检测 (ROI + 定期全帧扫描)
-                        if targets:
+                        # own_only 模式用 own_targets 作为 ROI 源
+                        color_targets = own_targets if own_only else targets
+                        if color_targets:
                             # 有颜色目标 → ROI Tag 精确分类
                             top_targets = sorted(
-                                targets, key=lambda t: t.area,
+                                color_targets, key=lambda t: t.area,
                                 reverse=True)[:2]
                             roi_tags = self.tag_detector.detect_tags_in_rois(
                                 frame, top_targets)
@@ -578,8 +600,10 @@ class VisionSystem:
                                 tag_type_override = TagDetector.classify_tag(
                                     best['id'], self.comm.my_color)
 
-                        # 孤儿 Tag: 不匹配任何颜色目标 → 无条件作为独立目标
+                        # 孤儿 Tag: 不匹配任何颜色目标 → 画面中心区域才信任
+                        # D2: 边缘区域孤儿 Tag 可能是场外 Tag, 跟踪会导致跑出擂台
                         if tags:
+                            edge_m = getattr(config, 'ORPHAN_TAG_EDGE_MARGIN', 60)
                             for tg in tags:
                                 orphan = True
                                 for ct in (targets or []):
@@ -589,12 +613,30 @@ class VisionSystem:
                                         orphan = False
                                         break
                                 if orphan:
+                                    tcx, tcy = tg['cx'], tg['cy']
+                                    if (tcx < edge_m or
+                                            tcx > config.CAMERA_WIDTH - edge_m or
+                                            tcy < edge_m or
+                                            tcy > config.CAMERA_HEIGHT - edge_m):
+                                        continue
                                     tag_standalone = tg
                                     break  # 最大面积优先 (tags已排序)
 
                 t_det = time.perf_counter()
 
                 # 5. 发送 [计时: uart]
+                # E1: 目标类型变化 X→非X 时强制立即发送 (跳过频率限制)
+                _has_target = bool(
+                    (collect_mode and tags) or
+                    tag_type_override or
+                    tag_standalone or
+                    (own_only and own_targets) or
+                    (not own_only and (enemies or neutrals or friends))
+                )
+                if _has_target and self._last_sent_type == 'X':
+                    self.comm.force_send_now()
+                self._last_sent_type = 'T' if _has_target else 'X'
+
                 # 优先级: Tag分类 > 颜色分类 (Tag是地面真值, 颜色可能误判)
                 if collect_mode:
                     if tags:
@@ -655,31 +697,30 @@ class VisionSystem:
                                         len(enemies), len(neutrals),
                                         len(friends), len(tags))
 
-                # 8. 终端状态输出
-                if frame_idx % 15 == 0:
+                # 8. 终端状态输出 (v2: 时间节流 + 换行, 修 journalctl blob)
+                now_print = time.time()
+                if now_print - self._last_status_print_ts >= self._status_print_interval:
                     uart_s = 'OK' if (self.comm.ser
-                                      and self.comm._tx_errors == 0) else 'ERR'
+                                      and self.comm.tx_errors == 0) else 'ERR'
                     if own_only:
                         pstr = ''
                         if pt:
                             pstr = (f' >> F({pt.cx},{pt.cy} '
                                     f'dir={pt.direction:+.2f})')
-                        sys.stdout.write(
-                            f'\r[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
-                            f'UART:{uart_s} TX:{self._tx_count} '
-                            f'OWN:{n_own}{pstr}      ')
+                        print(f'[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
+                              f'UART:{uart_s} TX:{self._tx_count} '
+                              f'OWN:{n_own}{pstr}', flush=True)
                     else:
                         tag_s = ''
                         if tag_type_override:
                             tag_s = f' T:{tag_type_override}'
                         elif tag_standalone:
                             tag_s = f' T:id{tag_standalone["id"]}'
-                        sys.stdout.write(
-                            f'\r[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
-                            f'UART:{uart_s} TX:{self._tx_count} '
-                            f'E:{len(enemies)} N:{len(neutrals)} '
-                            f'F:{len(friends)}{tag_s}      ')
-                    sys.stdout.flush()
+                        print(f'[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
+                              f'UART:{uart_s} TX:{self._tx_count} '
+                              f'E:{len(enemies)} N:{len(neutrals)} '
+                              f'F:{len(friends)}{tag_s}', flush=True)
+                    self._last_status_print_ts = now_print
 
                 # 9. 流媒体 [计时: anno + stream]
                 t_anno_start = time.perf_counter()
@@ -765,9 +806,12 @@ class VisionSystem:
                     self._perf_stream = 0.0
                     self._perf_count = 0
 
-                # 12. 帧率限速
+                # 12. 帧率限速 (防漂移: 处理超时时跳帧而非累积延迟)
                 self._sleep_until(next_frame)
                 next_frame += frame_dt
+                now_pc = time.perf_counter()
+                if next_frame < now_pc - frame_dt:
+                    next_frame = now_pc  # 丢弃落后的帧时隙
 
         except KeyboardInterrupt:
             print('\nStopping...')
@@ -778,13 +822,17 @@ class VisionSystem:
             print('Vision system stopped.')
 
     def _on_camera_reconnect(self):
-        """相机重连回调: 清除 Tracker 旧轨迹 + 重置 EMA"""
+        """相机重连回调: 清除 Tracker 旧轨迹 + 重置 EMA + 恢复动态 WB"""
         if self.detector._tracker:
             self.detector._tracker._tracks.clear()
             self.detector._tracker._next_id = 0
         self.detector._last_max_area = 0
-        self.detector._last_bboxes = []
-        print('[CAMERA] Tracker state cleared after reconnect')
+        self._last_tags = []
+        # 重连后恢复当前颜色对应的 WB (运行中可能已切换)
+        if self.camera.cap and config.AUTO_WB == 0:
+            self.camera.cap.set(cv2.CAP_PROP_WB_TEMPERATURE,
+                                config.WB_TEMPERATURE)
+        print(f'[CAMERA] Reconnected, Tracker cleared, WB={config.WB_TEMPERATURE}K')
 
     def _send_tag_target(self, tag):
         """将 Tag 检测结果分类并发送给 STM32 (消除重复的 classify+direction+send 模式)"""
@@ -802,6 +850,7 @@ class VisionSystem:
             self._drop_sending_G = False
             self._drop_confirm_count = 0
             self.detector.reset_drop_ema()
+            self._last_tags = []  # 清理残留 Tag 缓存
             self.comm.active = True
             self.comm.drop_recovery = False
             extra = ' → RESET TO NORMAL DETECT'
@@ -810,12 +859,14 @@ class VisionSystem:
             self._drop_sending_G = False
             self._drop_confirm_count = 0
             self.detector.reset_drop_ema()
+            self._last_tags = []  # 进入掉台模式, 清理残留 Tag
             extra = ' → DROP RECOVERY MODE'
         elif cmd in ('s', 'S'):
             self._drop_start_time = 0.0
             self._drop_sending_G = False
             self._drop_confirm_count = 0
             self.detector.reset_drop_ema()
+            self._last_tags = []  # 恢复正常模式, 清理残留 Tag
             if not self.comm.drop_recovery:
                 extra = ' → NORMAL DETECT MODE'
 
@@ -846,7 +897,7 @@ class VisionSystem:
         h, w = frame.shape[:2]
         bar_y = h - 30  # 状态栏 y 位置
 
-        if not self.comm._echo_enabled:
+        if not self.comm.echo_enabled:
             # 未启用
             cv2.circle(frame, (15, bar_y + 5), 6, (128, 128, 128), -1)
             cv2.putText(frame, 'ECHO OFF', (28, bar_y + 10),
@@ -855,8 +906,8 @@ class VisionSystem:
 
         echo_ok = self.comm.echo_confirmed
         echo_healthy = self.comm.echo_healthy
-        echo_count = self.comm._echo_count
-        lag_ms = self.comm._echo_latency
+        echo_count = self.comm.echo_count
+        lag_ms = self.comm.echo_latency_ms
 
         if echo_ok:
             # 确认收到 — 绿色
@@ -914,6 +965,19 @@ def main():
     parser.add_argument('--mode', choices=['fight', 'collect'],
                         default='fight',
                         help='Initial mode: fight(color) or collect(tag)')
+    parser.add_argument('--backend', choices=['color', 'npu', 'onnx', 'fused'],
+                        default=os.environ.get('VISION_BACKEND', 'color'),
+                        help='Detection backend: color=HSV (default), '
+                             'npu=YOLOv5 .nb on VIP9000, '
+                             'onnx=YOLOv5 ONNX CPU 推理 (过渡方案)')
+    parser.add_argument('--npu-model', default='/home/radxa/models/best.nb',
+                        help='Path to .nb model when --backend=npu')
+    parser.add_argument('--onnx-model', default='/home/radxa/models/best_320_int8.onnx',
+                        help='Path to .onnx model when --backend=onnx')
+    parser.add_argument('--onnx-conf', type=float, default=0.4,
+                        help='ONNX backend confidence threshold')
+    parser.add_argument('--onnx-iou', type=float, default=0.45,
+                        help='ONNX backend NMS IoU threshold')
     args = parser.parse_args()
 
     if args.priority_mode:
@@ -925,6 +989,13 @@ def main():
                                  else config.WB_BLUE)
         print(f'[AUTO-WB] color={args.color} → WB={config.WB_TEMPERATURE}K')
 
+    # v2 (B4): 启动时打印一次完整配置快照, 便于赛场快速诊断
+    if hasattr(config, 'snapshot'):
+        try:
+            config.snapshot()
+        except Exception as e:
+            print(f'[WARN] config.snapshot() failed: {e}')
+
     vision = VisionSystem(
         debug=args.debug,
         calibrate=args.calibrate,
@@ -935,6 +1006,71 @@ def main():
     )
     vision.comm.my_color = args.color
     vision.comm.mode = args.mode
+
+    # P2 紧急覆盖: VISION_BACKEND_OVERRIDE=hsv 强制走 HSV-only (不初始化 ONNX)
+    # 优先级最高 - 用于赛场一键回退, 通过 systemctl edit 注入
+    backend_override = getattr(config, 'VISION_BACKEND_OVERRIDE', '').lower()
+    if backend_override == 'hsv':
+        print('[backend] *** EMERGENCY OVERRIDE: VISION_BACKEND_OVERRIDE=hsv ***')
+        print('[backend] forcing HSV-only (ONNX/Fused 跳过初始化)')
+        args.backend = 'color'
+
+    # Backend 切换 (lane D 集成 + ONNX 过渡方案 + Fused 融合方案)
+    if args.backend == 'fused':
+        try:
+            from fused_detector import FusedDetector  # noqa: E402
+            print(f'[backend] FUSED (HSV + ONNX + Tag 加权融合) enabled')
+            vision.detector = FusedDetector(
+                onnx_model_path=args.onnx_model,
+                onnx_conf_thresh=args.onnx_conf,
+                onnx_iou_thresh=args.onnx_iou,
+            )
+        except Exception as e:
+            print(f'[backend] fused init failed ({e}), falling back to color')
+    elif args.backend in ('npu', 'onnx'):
+        try:
+            # 优先从 tools/deploy 导入 (PC 开发); 板端把 *_inference.py 拷到 sys.path
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools', 'deploy'))
+            sys.path.insert(0, '/home/radxa/tools_deploy')
+            if args.backend == 'npu':
+                from viplite_inference import NpuDetector  # noqa: E402
+                print(f'[backend] NPU enabled, model={args.npu_model}')
+                vision.detector = NpuDetector(model_path=args.npu_model)
+            else:  # onnx
+                # 优先本目录的 onnx_detector (高精度版, ColorDetector 子类, 完整兼容)
+                # fallback 到 tools/deploy/onnx_inference (过渡方案, NpuTarget 接口)
+                try:
+                    from onnx_detector import OnnxDetector  # vision_upload/
+                    print(f'[backend] ONNX (CPU INT8) enabled, '
+                          f'model={args.onnx_model}, conf={args.onnx_conf}')
+                    vision.detector = OnnxDetector(
+                        model_path=args.onnx_model,
+                        conf_thresh=args.onnx_conf,
+                        iou_thresh=args.onnx_iou,
+                        enable_tracking=True,
+                    )
+                except ImportError:
+                    from onnx_inference import OnnxDetector  # tools/deploy/
+                    print(f'[backend] ONNX (legacy) enabled, model={args.onnx_model}')
+                    vision.detector = OnnxDetector(
+                        model_path=args.onnx_model,
+                        conf_thresh=args.onnx_conf,
+                        iou_thresh=args.onnx_iou,
+                    )
+        except ImportError as e:
+            print(f'[backend] {args.backend} import failed ({e}), falling back to color')
+        except Exception as e:
+            print(f'[backend] {args.backend} init failed ({e}), falling back to color')
+
+    # P1: 启动 ThermalGuard (需要在 detector 替换后 + run() 启动前)
+    # ColorDetector 没有 set_throttled, guard 只监控不动作 (FusedDetector 完整支持)
+    try:
+        from thermal_guard import ThermalGuard  # noqa: E402
+        vision._thermal_guard = ThermalGuard(vision.detector)
+        vision._thermal_guard.start()
+    except Exception as e:
+        print(f'[thermal_guard] init failed ({e}), 跳过温度守护', flush=True)
+
     vision.run()
 
 

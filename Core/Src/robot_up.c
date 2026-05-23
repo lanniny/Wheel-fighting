@@ -129,7 +129,7 @@ void GoUp_Update()
         case GOUP_CONFIRM:
             MOTOR_StopAll();
             site_detect_shade();
-            if(voltage_v0 < 2.9f && voltage_v1 < 2.9f)
+            if(voltage_v0 < 2.8f && voltage_v1 < 2.8f)
             {
                 if(GoUp_ShadeCount < GOUP_SHADE_CONFIRM_COUNT)
                 {

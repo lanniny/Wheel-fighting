@@ -12,5 +12,6 @@ typedef enum {
 
 void Robot_Control_Init(void);
 void Robot_Control_Update(void);
+RobotState Robot_Control_GetState(void);
 
 #endif
