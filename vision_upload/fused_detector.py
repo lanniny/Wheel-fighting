@@ -127,6 +127,14 @@ class FusedDetector:
         self._thermal_throttled = False
         self._hsv_only_min_area_default = self.hsv_only_min_area
         self._throttle_warmup = 0  # ONNX 恢复后预热帧计数
+        # 2026-05-23 致命修复: ONNX stale 自动降级
+        # ONNX 推理变慢 → 结果超时被丢弃 → onnx_targets=[]
+        # 但 ThermalGuard 还没触发 → hsv_only_min_area 仍是 6000
+        # → 中远距离真实目标全被过滤 → 视觉发 X → STM32 纯 IR 乱撞
+        self._onnx_empty_streak = 0  # 连续 ONNX 空结果帧数
+        self._onnx_good_streak = 0   # 连续 ONNX 有结果帧数 (恢复滞回用)
+        self._ONNX_EMPTY_THRESH = 5  # 连续 N 帧空结果就自动放松阈值
+        self._ONNX_RECOVER_THRESH = 20  # 连续 N 帧有结果才恢复严格阈值 (防震荡)
 
         # 内部 HSV (关 tracker, 用我们自己的 fused tracker)
         self._hsv = ColorDetector(enable_tracking=False)
@@ -189,6 +197,30 @@ class FusedDetector:
             self._throttle_warmup -= 1
         else:
             onnx_targets = self._onnx.detect(frame)   # 0ms (async cache)
+
+        # 2026-05-23 致命修复: ONNX 结果持续为空时自动放松 HSV 过滤
+        # 防止 "ONNX stale + hsv_only_min_area=6000" 杀死所有中远距离目标
+        # v2: 加恢复滞回 — 偶尔 1 帧有结果不足以证明 ONNX 稳定，需连续 20 帧才恢复
+        if not onnx_targets and not self._thermal_throttled:
+            self._onnx_empty_streak += 1
+            self._onnx_good_streak = 0  # 打断恢复计数
+            if self._onnx_empty_streak == self._ONNX_EMPTY_THRESH:
+                relaxed = max(2000, self._hsv_only_min_area_default // 3)
+                print(f'[fused_detector] ONNX empty x{self._onnx_empty_streak} '
+                      f'→ auto-relax hsv_only_min={self.hsv_only_min_area}'
+                      f'→{relaxed}', flush=True)
+                self.hsv_only_min_area = relaxed
+        elif onnx_targets and not self._thermal_throttled:
+            self._onnx_empty_streak = 0
+            self._onnx_good_streak += 1
+            # 恢复滞回: 需连续 N 帧 ONNX 有结果才恢复严格阈值
+            if (self._onnx_good_streak >= self._ONNX_RECOVER_THRESH and
+                    self.hsv_only_min_area != self._hsv_only_min_area_default):
+                print(f'[fused_detector] ONNX stable x{self._onnx_good_streak} '
+                      f'→ restore hsv_only_min={self._hsv_only_min_area_default}',
+                      flush=True)
+                self.hsv_only_min_area = self._hsv_only_min_area_default
+
         fused = self._fuse(hsv_targets, onnx_targets)
         if self._tracker:
             fused = self._tracker.update(fused)
@@ -206,11 +238,17 @@ class FusedDetector:
         if old != self._thermal_throttled:
             if self._thermal_throttled:
                 self.hsv_only_min_area = max(2000, self._hsv_only_min_area_default // 3)
+                self._onnx_empty_streak = 0
+                self._onnx_good_streak = 0
                 mode = 'HSV-ONLY (ONNX skipped)'
             else:
-                self.hsv_only_min_area = self._hsv_only_min_area_default
+                # 恢复时不立即拉回6000! 保持宽松阈值直到 ONNX 稳定产出
+                # (warmup + 初始几帧 ONNX 结果不稳定, 防 6000 杀目标)
+                self.hsv_only_min_area = max(2000, self._hsv_only_min_area_default // 3)
                 self._throttle_warmup = 3
-                mode = 'HSV+ONNX FUSED'
+                self._onnx_empty_streak = 0
+                self._onnx_good_streak = 0
+                mode = 'HSV+ONNX FUSED (hsv_min stays relaxed until ONNX stable)'
             print(f'[fused_detector] mode → {mode} '
                   f'hsv_only_min={self.hsv_only_min_area} '
                   + (f'({reason})' if reason else ''), flush=True)
@@ -245,9 +283,20 @@ class FusedDetector:
           - 分歧 → 按 color_conflict_policy ('neutral'/'hsv'/'onnx'/'drop')
           - 仅 HSV 检到 → 要求 area >= hsv_only_min_area 才信任 (过滤远端假目标)
           - 仅 ONNX 检到 → 直接信 (ONNX 不会假阳性远端环境, 训练集决定)
+
+        2026-05-23 修复: 当 ONNX 完全没有贡献时 (onnx_targets=[]),
+        所有目标走 HSV-only 路径, 此时用宽松阈值避免杀死真实目标。
         """
         used_onnx = set()
         result = []
+
+        # 当 ONNX 完全没贡献时, 用宽松阈值 (和 thermal_throttled 等效)
+        onnx_absent = len(onnx_targets) == 0
+        effective_hsv_min = self.hsv_only_min_area
+        effective_white_min = self.hsv_only_white_min_area
+        if onnx_absent:
+            effective_hsv_min = max(2000, self.hsv_only_min_area // 3)
+            effective_white_min = max(1500, self.hsv_only_white_min_area // 2)
 
         for h in hsv_targets:
             best_i, best_d = -1, self.match_dist_px
@@ -259,14 +308,10 @@ class FusedDetector:
                     best_d, best_i = d, i
 
             if best_i < 0:
-                # v3+v4: 仅 HSV 检到 = 低置信 → 必须 area 达阈值才信任
-                # 远端 HSV 假目标 (area 小) 大概率是环境噪声 (反光/墙/灯光),
-                # ONNX 因不在训练分布不会检测, 单凭 HSV 不能确认是真目标
-                # white 走更宽松阈值 (ONNX 几乎不识别白色, HSV 是唯一权威)
                 if h.color == 'white':
-                    min_area = self.hsv_only_white_min_area
+                    min_area = effective_white_min
                 else:
-                    min_area = self.hsv_only_min_area
+                    min_area = effective_hsv_min
                 if h.area >= min_area:
                     result.append(h)
                 else:
