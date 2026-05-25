@@ -1,23 +1,46 @@
 [Unit]
-Description=Robot Vision System v6
-After=network.target dev-ttySTM32.device
-Wants=dev-ttySTM32.device
+Description=Robot Vision System v6 (HSV + ONNX + AprilTag 加权融合)
+After=network.target dev-ttyUSB0.device
+Wants=dev-ttyUSB0.device
 
 [Service]
 Type=simple
 User=radxa
 WorkingDirectory=/home/radxa/vision_upload
-# 等待 USB 设备枚举 (CH340 ~2-3s), 每0.3s检查, 最多等3s
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 10); do [ -e /dev/ttySTM32 ] && exit 0; sleep 0.3; done; echo "WARN: ttySTM32 not found"'
-ExecStart=/usr/bin/python3 main.py --color b --priority-mode attack
+
+# 等待 USB-TTL 串口就绪，每 0.3s 检查，最多等 3s
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 10); do [ -e /dev/ttyUSB0 ] && exit 0; sleep 0.3; done; echo "WARN: ttyUSB0 not found"'
+
+# 主程序: backend=fused (HSV + ONNX CPU INT8 + AprilTag 加权)
+ExecStart=/usr/bin/python3 main.py --color b --priority-mode attack --backend fused
+
 Restart=always
 RestartSec=1
-# 使用 udev 稳定符号链接, 不再硬编码 ttyUSB0
-Environment=VISION_UART=/dev/ttySTM32
+# v2: graceful shutdown 给 SIGTERM 10s 处理时间, 让 ONNX worker / UART / camera 优雅退出
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# === 环境变量 ===
+# 串口 (USB-TTL CH340 接 STM32)
+Environment=VISION_UART=/dev/ttyUSB0
+# Python 行缓冲, 让 print 立即可见
+Environment=PYTHONUNBUFFERED=1
+# 主循环帧率 (ONNX 单帧 ~150ms, 主循环靠异步 worker)
+Environment=VISION_FPS=10
+# 状态行输出节流 (秒) - 修 journalctl blob data
+Environment=VISION_STATUS_INTERVAL_S=5.0
+# 图像增强
 Environment=VISION_CLAHE=1
-Environment=VISION_FPS=30
 Environment=VISION_AUTO_WB=0
 Environment=VISION_WB_TEMP=4200
+# ONNX worker: A76 绑核 (cpu6,7) + 2 线程匹配大核数
+# 注: threads>2 会让多余线程抢 A55 拖慢主循环 (2026-05-21 实测 4 线程跌到 5.7 FPS)
+Environment=VISION_ONNX_THREADS=2
+Environment=VISION_ONNX_ASYNC=1
+# 异步目标年龄上限 (秒), 超过视为失效 (防 worker 死亡时追幽灵)
+Environment=VISION_ONNX_TARGET_MAX_AGE_S=0.5
+# UART 初始重试次数 (5→3, 配合 ExecStartPre 已等 3s, 减少无串口时启动阻塞)
+Environment=VISION_UART_RETRIES=3
 
 [Install]
 WantedBy=multi-user.target

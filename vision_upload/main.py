@@ -148,11 +148,11 @@ class Camera:
 
     def open(self):
         dev = config.CAMERA_DEVICE
-        print(f'Opening camera: {dev}')
-        self.cap = cv2.VideoCapture(dev)
+        print(f'Opening camera: {dev} (V4L2)')
+        self.cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
         if not self.cap.isOpened():
-            print(f'[WARN] Default backend failed, trying V4L2...')
-            self.cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+            print(f'[WARN] V4L2 failed, trying default backend...')
+            self.cap = cv2.VideoCapture(dev)
         if not self.cap.isOpened():
             print(f'ERROR: cannot open {dev}')
             return False
@@ -817,10 +817,20 @@ class VisionSystem:
         except KeyboardInterrupt:
             print('\nStopping...')
         finally:
+            if self._thermal_guard:
+                self._thermal_guard.stop()
             self.camera.release()
             self.comm.close()
             det_logger.info('=== Vision stopped ===')
             print('Vision system stopped.')
+
+    def _clear_tracker(self):
+        """清空 Tracker 旧轨迹 (掉台进出 / 模式切换时调用)"""
+        tr = getattr(self.detector, '_tracker', None)
+        if tr:
+            tr._tracks.clear()
+            tr._next_id = 0
+        self.detector._last_max_area = 0
 
     def _on_camera_reconnect(self):
         """相机重连回调: 清除 Tracker 旧轨迹 + 重置 EMA + 恢复动态 WB"""
@@ -858,7 +868,8 @@ class VisionSystem:
             self._drop_sending_G = False
             self._drop_confirm_count = 0
             self.detector.reset_drop_ema()
-            self._last_tags = []  # 清理残留 Tag 缓存
+            self._last_tags = []
+            self._clear_tracker()
             self.comm.active = True
             self.comm.drop_recovery = False
             extra = ' → RESET TO NORMAL DETECT'
@@ -867,14 +878,16 @@ class VisionSystem:
             self._drop_sending_G = False
             self._drop_confirm_count = 0
             self.detector.reset_drop_ema()
-            self._last_tags = []  # 进入掉台模式, 清理残留 Tag
+            self._last_tags = []
+            self._clear_tracker()
             extra = ' → DROP RECOVERY MODE'
         elif cmd in ('s', 'S'):
             self._drop_start_time = 0.0
             self._drop_sending_G = False
             self._drop_confirm_count = 0
             self.detector.reset_drop_ema()
-            self._last_tags = []  # 恢复正常模式, 清理残留 Tag
+            self._last_tags = []
+            self._clear_tracker()
             if not self.comm.drop_recovery:
                 extra = ' → NORMAL DETECT MODE'
 

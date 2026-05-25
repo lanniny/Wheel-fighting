@@ -9,6 +9,7 @@
 #include "obstacle.h"
 #include "shade.h"
 #include "jy62.h"
+#include "vision_parser.h"
 
 #define BACKUP_WALL_BLOCK_CONFIRM_COUNT 3u
 
@@ -31,6 +32,7 @@ static bool Backup_Done = false;
 static uint8_t Backup_OnStageCount = 0;
 static uint8_t Backup_WallBlockedCount = 0;
 static float Backup_TurnTargetYaw = 0.0f;
+static char Backup_StableVisionType = 'X';
 
 static const float Backup_SearchYawTargets[] = {0.0f, 90.0f, 180.0f, -90.0f};
 
@@ -93,9 +95,21 @@ static int Backup_IsFrontBoundaryBlocked(void)
     return (Obs_Data.IR4 == OBS_BLOCKED_STATE && Obs_Data.IR11 == OBS_BLOCKED_STATE);
 }
 
+static char Backup_GetVisionType(void)
+{
+    if(Vision_IsTimeout() || !vision_target.valid)
+    {
+        Backup_StableVisionType = 'X';
+        return 'X';
+    }
+
+    Backup_StableVisionType = vision_target.type;
+    return Backup_StableVisionType;
+}
+
 static int Backup_IsWallBlocked(void)
 {
-    return (Obs_Data.IR3 == OBS_BLOCKED_STATE && Obs_Data.IR5 == OBS_BLOCKED_STATE);
+    return (Backup_GetVisionType() == 'G');
 }
 
 static int Backup_IsWallBlockedConfirmed(void)
@@ -182,6 +196,7 @@ void Backup_Init(void)
     Backup_OnStageCount = 0;
     Backup_WallBlockedCount = 0;
     Backup_TurnTargetYaw = 0.0f;
+    Backup_StableVisionType = 'X';
 }
 
 void Backup_Update(void)
@@ -366,5 +381,5 @@ uint8_t Backup_DebugGetStage(void)
 
 char Backup_DebugGetStableVisionType(void)
 {
-    return 'X';
+    return Backup_StableVisionType;
 }

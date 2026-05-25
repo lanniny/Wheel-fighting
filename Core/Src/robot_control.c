@@ -10,6 +10,7 @@ static RobotState robot_state;
 
 static void Robot_Control_EnterRoaming(void)
 {
+    Vision_SendCmd('N');
     Roaming_Init();
     robot_state = ROBOT_ROAMING;
 }
@@ -17,6 +18,7 @@ static void Robot_Control_EnterRoaming(void)
 static void Robot_Control_EnterBackup(void)
 {
     MOTOR_BrakeAll();
+    Vision_SendCmd('D');
     Backup_Init();
     robot_state = ROBOT_BACKUP;
 }
@@ -94,7 +96,7 @@ void Robot_Control_Update(void)
             Backup_Update();
             if (Backup_IsDone())
             {
-                robot_state = ROBOT_ROAMING;
+                Robot_Control_EnterRoaming();
             }
             break;
     }

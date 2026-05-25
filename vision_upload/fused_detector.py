@@ -153,7 +153,7 @@ class FusedDetector:
         # 自己的 Tracker (平滑 fused 结果)
         if enable_tracking:
             self._tracker = Tracker(
-                smoothing=getattr(config, 'TRACKER_SMOOTH', 0.3),
+                smoothing=getattr(config, 'TRACKER_SMOOTHING', 0.3),
                 max_dist=getattr(config, 'TRACKER_MAX_DIST', 100),
                 max_lost=getattr(config, 'TRACKER_MAX_LOST', 5),
             )

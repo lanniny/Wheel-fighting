@@ -146,12 +146,19 @@ class UartComm:
         if now - self._last_reconnect < self._reconnect_backoff:
             return
         self._last_reconnect = now
+        import glob
+        has_usb = bool(glob.glob('/dev/ttyUSB*'))
+        has_acm = bool(glob.glob('/dev/ttyACM*'))
+        has_sym = os.path.exists('/dev/ttySTM32')
+        if not (has_usb or has_acm or has_sym):
+            self._reconnect_backoff = min(
+                self._reconnect_backoff * 2, self._RECONNECT_MAX)
+            return
         print(f'[UART] Reconnecting (backoff={self._reconnect_backoff:.0f}s)...')
         self.close()
         if self.open():
             print('[UART] Reconnected OK')
         else:
-            # 指数退避: 2→4→8→8s
             self._reconnect_backoff = min(
                 self._reconnect_backoff * 2, self._RECONNECT_MAX)
             print(f'[UART] Reconnect failed, next retry in '
