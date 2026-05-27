@@ -72,7 +72,7 @@ void ENCODER_ResetAll(void)
     ENCODER_ResetCount(ENCODER_4);
 }
 
- // ==================== 更新编码器数据（在10ms定时中断中调用）====================
+ // ==================== 更新编码器数据（按控制周期调用）====================
 void ENCODER_Update(void)
 {
     int32_t current_count;

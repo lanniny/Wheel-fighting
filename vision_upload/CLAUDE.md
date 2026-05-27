@@ -6,7 +6,48 @@
 
 | 时间 | 变更 |
 |------|------|
+| 2026-05-21 | Sprint 1+2 激进重构: A1-A6 + B4/B5 + C3/C4 + D3 共 10 项 (Codex 评审采纳) |
 | 2026-04-08 | 初始生成模块文档 |
+
+## Sprint 1+2 (2026-05-21) 改动摘要
+
+| ID | 改动 | 文件 |
+|----|------|------|
+| A1 | 主循环 `\r` 单行刷新 → 时间节流换行 print (修 journalctl blob data) | main.py |
+| A2 | ONNX 推理统计改 ring buffer (最近 100 帧) + `_max_infer_ms` 单帧峰值 | onnx_detector.py |
+| A3 | `_submit_async` 内 `frame.copy()` 防 V4L2 MMAP 数据竞争 | onnx_detector.py |
+| A4 | `_async_targets_ts` 时间戳, 超 0.5s 视为失效返回 [] | onnx_detector.py |
+| A5 | 清理板上 `config.py.bak_*` 残留 + `.gitignore` 加 `*.bak_*` | radxa, .gitignore |
+| A6 | vision.service `ExecStartPre` echo 文案: ttyAS1 → ttyUSB0 | vision.service |
+| B4 | 散落 env vars (`VISION_FUSE_*` / `VISION_ONNX_*` / `VISION_LOG`) 全部收编到 config.py | config.py + detectors |
+| B5 | `CAMERA_DEVICE` / `UART_PORT` 改 PEP 562 `__getattr__` 懒求值 | config.py |
+| C3 | `subprocess stty low_latency` 失败 warning (不再静默) | comm.py |
+| C4 | `errno 5/6/19` 硬编码 → `errno.EIO/ENXIO/ENODEV` 常量 | comm.py |
+| D3 | 删除 `comm.py:send_tag()` 死代码 (已被 `_send_tag_target` 取代) | comm.py |
+
+启动时 `config.snapshot()` 输出 17 行完整配置快照, 赛场快速诊断用。
+
+## Backlog (赛后再做, Codex 评审建议推后)
+
+| ID | 推后任务 | 推后原因 |
+|----|---------|---------|
+| B1 | main.py `VisionSystem.run()` 471 行 mega-method 拆分 | 掉台迟滞状态机横跨整个方法, 赛前重构有引入静默 bug 风险, 必须先有集成测试 |
+| B2 | MJPEG `StreamServer` 类抽取 (替代全局 `_stream_jpg`) | 收益低, 风险中等 |
+| C1 | Camera 重连时 detector.reset() 统一钩子 | A4 时间戳过期已缓解大部分症状 |
+| C2 | ONNX worker supervisor (健康监控 + 自动重启) | A4 时间戳过期已让主循环避免追幽灵, supervisor 锦上添花 |
+| E1 | /health HTTP 端点 | `systemctl status` + tail log 已够用 |
+| E2 | MJPEG JPEG 编码异步化 | 1-3ms 不是瓶颈 (相对 175ms ONNX), 典型过早优化 |
+| D2 | 完整类型注解 (全公共 API) | 收益低, 优先稳定 |
+| -- | 辅助脚本归档 (cam_test/uart_test/uart_debug 等) | 保留实地调试方便 |
+
+## 已知硬件限制 (2026-05-21 实测)
+
+- **CPU 热降频严重**: 大核温度持续 92-93°C (远超 60°C trip_point), 所有核被 kernel 强制限速到 **416MHz** (原 A55=1.79GHz / A76=2.0GHz)
+- **后果**: ONNX 推理从 17 FPS → 5 FPS, 主循环 9.8 → 5.5 FPS
+- **风扇**: PWM 已满转 255/255, 仍压不住
+- **代码层无解**, 需主人物理排查散热
+
+
 
 ## 模块职责
 

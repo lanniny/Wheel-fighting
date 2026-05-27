@@ -38,7 +38,7 @@
 #define FIGHT_SHADE_CONFIRM_TIME 100U //V0/V1灰度掉台持续确认时间
 
 /* P1: 视觉距离融合 — 友方面积阈值 */
-#define FIGHT_FRIEND_MIN_AREA 5000 //友方最小面积: area<此值时忽略F(远距离友方不后退)
+#define FIGHT_FRIEND_MIN_AREA 800  //友方最小面积 (5000→800, 配合视觉端HSV检测+Tracker 3帧确认)
 
 /* P2: 视觉方向辅助IR — 方向阈值 */
 #define FIGHT_VISION_DIR_LEFT_THRESH  (-30) //视觉方向<此值判定前左

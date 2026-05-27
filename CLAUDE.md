@@ -2,6 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 多 AI 协作模式
+
+本项目接入 **Claude Code / Codex CLI / Gemini CLI** 三方协作体系（Claude 强主导）：
+
+- Claude Code = 总指挥（编排 / 文件操作 / MCP 调度）
+- Codex CLI   = 评审官（深推理 / second opinion / 沙箱执行）
+- Gemini CLI  = 情报官（长文档 / 多模态 / Web 检索）
+
+**全局宪法**：[`~/.ai-collab/rules.md`](file://~/.ai-collab/rules.md) — 三方共同遵守
+**项目共享区**：[`./.ai-shared/`](./.ai-shared/) — 当前任务上下文与产物交接（`context.md` / `decisions.md` / `handoff/`）
+**召唤方式**：
+- `Agent({subagent_type: "codex-reviewer", ...})` 或 `/co-review <file>`
+- `Agent({subagent_type: "gemini-researcher", ...})` 或 `/co-research <topic>`
+
+@~/.ai-collab/rules.md
+
 ## 变更记录 (Changelog)
 
 | 时间 | 变更 |

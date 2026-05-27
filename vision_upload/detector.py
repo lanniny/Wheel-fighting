@@ -64,6 +64,11 @@ class Tracker:
         self._tracks = {}
         self._next_id = 0
 
+    def clear(self):
+        """Clear all tracks and reset ID counter."""
+        self._tracks.clear()
+        self._next_id = 0
+
     def _predict_pos(self, tr):
         """线性外推预测下帧位置"""
         if not self.enable_prediction:
@@ -324,9 +329,11 @@ class ColorDetector:
                 continue
 
             # 底部画幅排除 (黄色专用): 台面近距离区域暖色反光集中
+            # 用质心而非边框底边判断, 防近距离能量块(质心在中部但边框触底)被误排
             if is_yellow and self._bottom_exclude > 0:
                 frame_h = hsv.shape[0]
-                if (y + h) > frame_h * (1 - self._bottom_exclude):
+                cy_check = y + h // 2
+                if cy_check > frame_h * (1 - self._bottom_exclude):
                     continue
 
             # 圆度过滤 (黄色专用): 能量块圆柱体~0.5-0.8, 噪声<0.3
@@ -367,9 +374,6 @@ class ColorDetector:
             targets.append(Target(color_name, cx, cy, x, y, w, h, area, solidity))
 
         targets.sort(key=lambda t: t.area, reverse=True)
-        # 更新上帧最大面积
-        if targets:
-            self._last_max_area = int(targets[0].area)
         return targets[:config.MAX_TARGETS]
 
     # ------------------------------------------------------------------
@@ -467,10 +471,10 @@ class ColorDetector:
         blue_targets = self._detect_color(
             hsv, 'blue', config.HSV_BLUE, exclusion_mask=white_excl)
 
-        # 蓝/白合并掩码, 给黄色检测用 (黄色不能跑到白色或蓝色区域)
-        if white_targets or blue_targets:
+        # 蓝色排斥掩码给黄色用 (防蓝黄重叠); 不排白色 — 白色S<18与黄色S>80无交叉
+        if blue_targets:
             yellow_excl = self._build_exclusion_mask(
-                hsv.shape[:2], white_targets + blue_targets, dilate_px=20)
+                hsv.shape[:2], blue_targets, dilate_px=20)
         else:
             yellow_excl = None
 
@@ -478,6 +482,10 @@ class ColorDetector:
             hsv, 'yellow', config.HSV_YELLOW, exclusion_mask=yellow_excl)
 
         all_targets = white_targets + blue_targets + yellow_targets
+
+        # B3: update _last_max_area once after all color detections
+        if all_targets:
+            self._last_max_area = int(max(t.area for t in all_targets))
 
         if not all_targets:
             all_targets = self._detect_close_range(hsv)
@@ -500,6 +508,10 @@ class ColorDetector:
             color_name, hsv_range = 'yellow', config.HSV_YELLOW
 
         targets = self._detect_color(hsv, color_name, hsv_range)
+
+        # B3: update _last_max_area after detection
+        if targets:
+            self._last_max_area = int(max(t.area for t in targets))
 
         if not targets:
             targets = self._detect_close_range(hsv, color_filter=(color_name, hsv_range))
@@ -677,25 +689,38 @@ class ColorDetector:
 
         return smoothed_ratio, cx_full, cy_full, smoothed_dir, dbg_info
 
+    @staticmethod
+    def _score_target(t):
+        """智能目标评分: 综合面积(距离) + 居中度 + 稳定性."""
+        w_area = getattr(config, 'PRIORITY_AREA_WEIGHT', 0.6)
+        w_center = getattr(config, 'PRIORITY_CENTER_WEIGHT', 0.3)
+        w_stable = getattr(config, 'PRIORITY_STABLE_WEIGHT', 0.1)
+        area_score = min(1.0, t.area / max(1, config.MAX_CONTOUR_AREA * 0.3))
+        center_score = 1.0 - min(1.0, abs(t.direction))
+        stable_score = min(1.0, t.solidity) if t.solidity > 0 else 0.5
+        return w_area * area_score + w_center * center_score + w_stable * stable_score
+
     def get_priority_target(self, friends, enemies, neutrals):
         """
-        获取最优先目标 (面积最大=最近优先)
+        获取最优先目标 (智能评分: 面积×居中度×稳定性)
         优先级由 config.PRIORITY_MODE 决定:
-          - 'collect': N(中立) > E(敌方) — 收集能量块得分为主
-          - 'attack':  E(敌方) > N(中立) — 推敌方能量块为主
+          - 'collect': N(中立) > E(敌方)
+          - 'attack':  E(敌方) > N(中立)
         返回: (type_char, target) 或 ('X', None)
         """
         mode = getattr(config, 'PRIORITY_MODE', 'collect')
         if mode == 'collect':
-            if neutrals:
-                return 'N', neutrals[0]
-            if enemies:
-                return 'E', enemies[0]
+            primary, p_type = neutrals, 'N'
+            secondary, s_type = enemies, 'E'
         else:
-            if enemies:
-                return 'E', enemies[0]
-            if neutrals:
-                return 'N', neutrals[0]
+            primary, p_type = enemies, 'E'
+            secondary, s_type = neutrals, 'N'
+        if primary:
+            best = max(primary, key=self._score_target)
+            return p_type, best
+        if secondary:
+            best = max(secondary, key=self._score_target)
+            return s_type, best
         return 'X', None
 
     def draw_targets(self, frame, targets, my_color='b'):

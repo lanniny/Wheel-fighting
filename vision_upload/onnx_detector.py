@@ -38,6 +38,7 @@ import os
 import sys
 import time
 import threading
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -124,7 +125,7 @@ class OnnxDetector(ColorDetector):
         self._infer_window = int(
             os.environ.get('VISION_ONNX_STATS_WIN',
                            str(getattr(config, 'ONNX_STATS_WINDOW', 100))))
-        self._infer_times = []          # ring buffer (deque-like list)
+        self._infer_times = deque(maxlen=self._infer_window)
         self._infer_count = 0           # 总计数 (用于日志触发周期)
         self._max_infer_ms = 0.0        # 历史单帧峰值 (检测热降频/卡顿)
         self._max_infer_ms_recent = 0.0 # 近窗口单帧峰值 (滑动)
@@ -233,35 +234,38 @@ class OnnxDetector(ColorDetector):
 
         v2 (Codex 评审 A3+A4 合并修复):
           - A3: frame.copy() 防 V4L2 MMAP BUFFERSIZE=1 数据竞争
-                (相机底层会在 worker 推理 150ms 期间覆盖同一块内存)
           - A4: 检查 _async_targets_ts 时间戳, 超过 max_age 视为失效返回 []
-                (worker 死亡 / 长时间无新帧 / 推理卡死时, 防止主循环追幽灵目标)
+        v3 (2026-05-25): Worker 死亡自动重启 — 不再永久降级
         """
+        # v3: Worker 健康检查 + 自动重启
+        if (self._async_worker is not None
+                and not self._async_worker.is_alive()
+                and not self._async_stop):
+            print('[onnx_detector] *** Worker died, auto-restarting ***',
+                  flush=True)
+            self._start_async_worker()
+
         with self._async_frame_lock:
-            # 仅在 worker 消费完上一帧时才更新 (None 表示空闲)
             if self._async_frame is None:
-                # A3: 拷贝 frame, 与相机 capture buffer 完全隔离
                 self._async_frame = frame.copy()
                 self._async_filter = color_filter
 
-        # A4: 检查 targets 新鲜度
         with self._async_targets_lock:
             targets_ts = self._async_targets_ts
             targets_copy = list(self._async_targets)
 
         if targets_ts <= 0:
-            # worker 还没产出过任何结果 (启动初期), 返回空列表
             return []
 
         age = time.time() - targets_ts
         if age > self._async_target_max_age:
-            # 老目标过期 — 偶发警告 (节流, 避免刷屏)
             now = time.time()
             if now - self._last_stale_warn > 5.0:
+                alive = (self._async_worker.is_alive()
+                         if self._async_worker else False)
                 print(f'[onnx_detector] WARN async targets stale ({age:.2f}s '
                       f'> {self._async_target_max_age:.2f}s), worker '
-                      f'alive={self._async_worker.is_alive() if self._async_worker else "N/A"}',
-                      flush=True)
+                      f'alive={alive}', flush=True)
                 self._last_stale_warn = now
             return []
         return targets_copy
@@ -292,8 +296,6 @@ class OnnxDetector(ColorDetector):
         elapsed_ms = (time.monotonic() - t0) * 1000
         self._infer_count += 1
         self._infer_times.append(elapsed_ms)
-        if len(self._infer_times) > self._infer_window:
-            self._infer_times.pop(0)
         # 历史峰值 (用于检测罕见卡顿)
         if elapsed_ms > self._max_infer_ms:
             self._max_infer_ms = elapsed_ms
@@ -391,21 +393,7 @@ class OnnxDetector(ColorDetector):
             out.append(t)
         return out
 
-    # ------------------------------------------------------------------
-    # classify: ONNX 输出 white(neutral) 时把它放入 neutrals,
-    # 与父类不一样 (父类已废弃白色) - 这里恢复 3 类区分
-    # ------------------------------------------------------------------
-    def classify(self, targets, my_color):
-        """根据己方颜色分类为 friends / enemies / neutrals.
-        相比父类: 把 ONNX 检测到的 neutral_block (color='white') 加入 neutrals."""
-        if my_color == 'b':
-            friend_color, enemy_color = 'blue', 'yellow'
-        else:
-            friend_color, enemy_color = 'yellow', 'blue'
-        friends  = [t for t in targets if t.color == friend_color]
-        enemies  = [t for t in targets if t.color == enemy_color]
-        neutrals = [t for t in targets if t.color == 'white']
-        return friends, enemies, neutrals
+    # A2: classify() 与父类 ColorDetector.classify() 完全相同, 不再重复 override
 
 
 # 自检 entry point

@@ -36,15 +36,15 @@ from socketserver import ThreadingMixIn
 
 # ============ UART Device Detection ============
 def find_uart():
-    """Auto-detect UART device: env > USB > GPIO"""
+    """Auto-detect UART device: env > USB-TTL > board UART"""
     env_uart = os.environ.get('VISION_UART')
     if env_uart and os.path.exists(env_uart):
         return env_uart
     usb_devs = sorted(glob.glob('/dev/ttyUSB*'))
     if usb_devs:
         return usb_devs[0]
-    if os.path.exists('/dev/ttyAS1'):
-        return '/dev/ttyAS1'
+    if os.path.exists('/dev/ttyAS3'):
+        return '/dev/ttyAS3'
     return '/dev/ttyUSB0'
 
 

@@ -219,7 +219,7 @@ class VisionSystem:
         self._tx_count = 0
         self._debug_thread = None
         self._last_valid_frame = time.time()
-        self._watchdog_timeout = getattr(config, 'WATCHDOG_TIMEOUT', 30.0)
+        self._watchdog_timeout = getattr(config, 'WATCHDOG_TIMEOUT', 5.0)
         self._stream_server = None
         self._stream_port = stream_port
         # 性能分析累加器
@@ -243,8 +243,23 @@ class VisionSystem:
                 str(getattr(config, 'STATUS_PRINT_INTERVAL_S', 5.0))))
         # P1 (2026-05-22): ThermalGuard 占位 (run() 启动时初始化, 需要 detector)
         self._thermal_guard = None
+        # TAHSV: Tag-Assisted Adaptive HSV
+        self._adaptive_hsv = None
+        if getattr(config, 'ADAPTIVE_HSV_ENABLED', True):
+            try:
+                from adaptive_hsv import AdaptiveHSV
+                self._adaptive_hsv = AdaptiveHSV()
+            except Exception as e:
+                print(f'[adaptive_hsv] init failed: {e}', flush=True)
         # E1: 上次发送的目标类型 (用于检测 X→非X 切换, 强制立即发送)
         self._last_sent_type = 'X'
+        # A1: 流媒体帧间隔 (从 config 读取, 替代硬编码 3)
+        self._stream_every_n = getattr(config, 'STREAM_EVERY_N_FRAMES', 3)
+        # P1 (2026-05-25): 目标丢失保持 (Holdover) — 短暂丢失不立即发 X
+        self._holdover_target = None    # 上次有效目标的快照 (type, cx, cy, area, dir)
+        self._holdover_frames = 0       # 已保持帧数
+        self._holdover_max = getattr(config, 'LOST_TARGET_HOLDOVER_FRAMES', 3)
+        self._holdover_decay = getattr(config, 'LOST_TARGET_AREA_DECAY', 0.7)
 
     def _update_fps(self):
         self._frame_count += 1
@@ -314,6 +329,12 @@ class VisionSystem:
         print(f'Log     : {LOG_PATH}')
         print('-' * 55)
 
+        print(f'TagPrime: {"ON" if getattr(config, "TAG_PRIMARY", True) else "OFF"}')
+        print(f'Adaptive: {"ON" if self._adaptive_hsv else "OFF"}')
+        print(f'Holdover: frames={self._holdover_max} decay={self._holdover_decay}')
+        print(f'PriScore: area_w={getattr(config, "PRIORITY_AREA_WEIGHT", 0.6)}'
+              f' center_w={getattr(config, "PRIORITY_CENTER_WEIGHT", 0.3)}'
+              f' stable_w={getattr(config, "PRIORITY_STABLE_WEIGHT", 0.1)}')
         det_logger.info('=== Vision started color=%s priority=%s ===',
                         self.comm.my_color,
                         getattr(config, 'PRIORITY_MODE', 'collect'))
@@ -326,13 +347,25 @@ class VisionSystem:
             while self._running:
                 t0 = time.perf_counter()
 
-                # 1. 读帧 [计时: cap]
+                # 1. UART 读命令 (必须在摄像头读帧之前, 因为 V4L2 select()
+                #    可能阻塞 10 秒, 期间 UART 完全不可用)
+                if self.use_uart:
+                    for cmd in self.comm.read_commands():
+                        self._handle_command(cmd)
+
+                # 2. 读帧 [计时: cap] — V4L2 可能阻塞数秒
                 frame = self.camera.read()
                 t_cap = time.perf_counter()
-                # 2. 先处理 STM32 指令，避免相机异常时串口处理被阻断
-                for cmd in self.comm.read_commands():
-                    self._handle_command(cmd)
+
+                # 3. 帧后再读一次 UART (捕获阻塞期间积累的命令)
+                if self.use_uart:
+                    for cmd in self.comm.read_commands():
+                        self._handle_command(cmd)
+
                 if frame is None:
+                    if self.use_uart:
+                        self.comm.force_send_now()
+                        self.comm.send_target('X')
                     if time.time() - self._last_valid_frame > self._watchdog_timeout:
                         print(f'\n[WATCHDOG] No valid frame for '
                               f'{self._watchdog_timeout:.0f}s, restarting camera...')
@@ -353,17 +386,14 @@ class VisionSystem:
                     drop_elapsed = time.time() - self._drop_start_time
 
                     if drop_elapsed >= drop_timeout:
-                        det_logger.info('DROP_TIMEOUT %.1fs elapsed, keep sending X until STM32 sends S', drop_elapsed)
-                        print(f'\n[DROP] Timeout {drop_elapsed:.1f}s, keep X (wait for S)')
-                        # 不退出 drop_recovery! 持续发 X 直到 STM32 发 'S'
-                        # 否则视觉切回正常模式发 E/N/F 会污染 Backup 类型消抖
-                        self._drop_sending_G = False
-                        self._drop_confirm_count = 0
-                        self.comm.force_send_now()
-                        self.comm.send_target('X')
-                        self._sleep_until(next_frame)
-                        next_frame += frame_dt
-                        continue
+                        # 超时自动退出掉台模式, 恢复正常颜色检测
+                        # 不再无限等待STM32发'S', 否则机器人永远卡在盲冲
+                        print(f'[DROP] AUTO-EXIT after {drop_elapsed:.1f}s timeout '
+                              f'(STM32 never sent S)', flush=True)
+                        det_logger.info('DROP_AUTO_EXIT %.1fs (forced)', drop_elapsed)
+                        self.comm.drop_recovery = False
+                        self._drop_start_time = 0.0
+                        self._reset_detection_state()
 
                     ratio, bcx, bcy, bdir, dbg = self.detector.detect_black_ratio(frame)
                     t_det = time.perf_counter()
@@ -453,7 +483,7 @@ class VisionSystem:
                         self._last_status_print_ts = now_print
 
                     # 流媒体: 标注黑色检测结果 (含迟滞状态)
-                    if self.stream and self._stream_server and frame_idx % 3 == 0:
+                    if self.stream and self._stream_server and frame_idx % self._stream_every_n == 0:
                         annotated = frame.copy()
                         h, w = frame.shape[:2]
                         mx, my = w // 6, h // 6
@@ -531,9 +561,27 @@ class VisionSystem:
                         self._last_tags = tags
                     else:
                         tags = self._last_tags
+                elif getattr(config, 'TAG_PRIMARY', True):
+                    # ── Tag-Primary: Tag + 己方色HSV(仅友方回避) ──
+                    # STM32 只处理 F(后退), E/N/X 不区分
+                    # 视觉唯一任务: 检测己方块 → 发 F
+                    # Tag: 任何可见 Tag → 精确判断类型
+                    # HSV: 仅检测己方颜色 → 补充 Tag 角度盲区
+                    own_targets = self.detector.detect_own(
+                        frame, self.comm.my_color)
+                    n_own = len(own_targets)
+                    pt = own_targets[0] if own_targets else None
+
+                    if self.tag_detector is not None:
+                        tags = self.tag_detector.detect_tags(frame)
+                        tags.sort(key=lambda t: int(t.get('area', 0)),
+                                  reverse=True)
+                        self._last_tags = tags
+                        if tags:
+                            tag_standalone = tags[0]
                 else:
-                    # ── 格斗模式: 颜色+Tag 融合 ("任一命中即生效") ──
-                    tag_standalone = None  # Tag独立目标 (颜色未命中时)
+                    # ── Legacy: HSV+Tag 融合 (TAG_PRIMARY=False) ──
+                    tag_standalone = None
 
                     if own_only:
                         own_targets = self.detector.detect_own(
@@ -550,16 +598,10 @@ class VisionSystem:
 
                     if self.tag_detector is not None:
                         match_dist = getattr(config, 'TAG_ROI_MATCH_DIST', 80)
-
-                        # 定期全帧 Tag 扫描 (发现白色/中立等无色块)
                         is_tag_scan_frame = (
                             frame_idx % self._tag_interval == 0)
-
-                        # Tag 检测 (ROI + 定期全帧扫描)
-                        # own_only 模式用 own_targets 作为 ROI 源
                         color_targets = own_targets if own_only else targets
                         if color_targets:
-                            # 有颜色目标 → ROI Tag 精确分类
                             top_targets = sorted(
                                 color_targets, key=lambda t: t.area,
                                 reverse=True)[:2]
@@ -567,8 +609,6 @@ class VisionSystem:
                                 frame, top_targets)
                         else:
                             roi_tags = []
-
-                        # 定期全帧扫描: 发现 ROI 外的 Tag
                         if is_tag_scan_frame:
                             full_tags = self.tag_detector.detect_tags(frame)
                             roi_ids = {t.get('id') for t in roi_tags}
@@ -585,10 +625,7 @@ class VisionSystem:
                             self._last_tags = tags
                         else:
                             tags = self._last_tags
-
-                        # Tag 分类覆盖 (Tag 是最高优先级)
                         if tags and pt:
-                            # 找与优先目标最近的 Tag
                             best = min(
                                 tags,
                                 key=lambda tg: ((tg['cx'] - pt.cx)**2
@@ -596,12 +633,8 @@ class VisionSystem:
                             d = ((best['cx'] - pt.cx)**2
                                  + (best['cy'] - pt.cy)**2) ** 0.5
                             if d < match_dist:
-                                # Tag 匹配颜色目标 → Tag 分类覆盖颜色分类
                                 tag_type_override = TagDetector.classify_tag(
                                     best['id'], self.comm.my_color)
-
-                        # 孤儿 Tag: 不匹配任何颜色目标 → 画面中心区域才信任
-                        # D2: 边缘区域孤儿 Tag 可能是场外 Tag, 跟踪会导致跑出擂台
                         if tags:
                             edge_m = getattr(config, 'ORPHAN_TAG_EDGE_MARGIN', 60)
                             orphan_ref = color_targets if color_targets else []
@@ -621,7 +654,12 @@ class VisionSystem:
                                             tcy > config.CAMERA_HEIGHT - edge_m):
                                         continue
                                     tag_standalone = tg
-                                    break  # 最大面积优先 (tags已排序)
+                                    break
+
+                # TAHSV: feed detected Tags to adaptive HSV calibrator
+                if self._adaptive_hsv and tags:
+                    for tg in tags:
+                        self._adaptive_hsv.feed_tag(frame, tg, self.comm.my_color)
 
                 t_det = time.perf_counter()
 
@@ -642,19 +680,82 @@ class VisionSystem:
                 if collect_mode:
                     if tags:
                         self._send_tag_target(tags[0])
+                        self._holdover_target = None
                     else:
                         self.comm.send_target('X')
                 elif tag_type_override and pt:
-                    # Tag+颜色匹配: 用Tag分类 + 颜色位置 (Tag分类更准)
                     self.comm.send_target(tag_type_override,
                                           pt.cx, pt.cy, pt.area, pt.direction)
+                    self._holdover_target = (tag_type_override, pt.cx, pt.cy, pt.area, pt.direction)
+                    self._holdover_frames = 0
                 elif tag_standalone:
-                    # Tag独立发现: 颜色未命中或不匹配, Tag说了算
                     self._send_tag_target(tag_standalone)
+                    self._holdover_target = None
+                elif getattr(config, 'TAG_PRIMARY', True):
+                    # Tag-Primary: HSV 仅用于友方回避
+                    # STM32 只处理 F, 其他类型无意义
+                    # 黄色队用更高门槛 (地板暖色调容易误检为黄色)
+                    if self.comm.my_color == 'y':
+                        min_fa = getattr(config, 'FRIEND_ALERT_AREA_YELLOW', 3000)
+                    else:
+                        min_fa = getattr(config, 'FRIEND_ALERT_AREA', 800)
+                    if own_targets and own_targets[0].area >= min_fa:
+                        t = own_targets[0]
+                        self.comm.send_target('F', t.cx, t.cy,
+                                              t.area, t.direction)
+                        self._holdover_target = ('F', t.cx, t.cy,
+                                                 t.area, t.direction)
+                        self._holdover_frames = 0
+                    elif self._holdover_target and self._holdover_frames < self._holdover_max:
+                        ht, hcx, hcy, ha, hd = self._holdover_target
+                        ha = int(ha * self._holdover_decay)
+                        self._holdover_target = (ht, hcx, hcy, ha, hd)
+                        self._holdover_frames += 1
+                        self.comm.send_target(ht, hcx, hcy, ha, hd)
+                    else:
+                        self._holdover_target = None
+                        self.comm.send_target('X')
                 elif own_only:
-                    self.comm.send_own_detection(own_targets)
+                    # Legacy HSV-primary (TAG_PRIMARY=False)
+                    if own_targets:
+                        self.comm.send_own_detection(own_targets)
+                        t0t = own_targets[0]
+                        self._holdover_target = ('F', t0t.cx, t0t.cy, t0t.area, t0t.direction)
+                        self._holdover_frames = 0
+                    elif self._holdover_target and self._holdover_frames < self._holdover_max:
+                        ht, hcx, hcy, ha, hd = self._holdover_target
+                        ha = int(ha * self._holdover_decay)
+                        self._holdover_target = (ht, hcx, hcy, ha, hd)
+                        self._holdover_frames += 1
+                        self.comm.send_target(ht, hcx, hcy, ha, hd)
+                    else:
+                        self._holdover_target = None
+                        self.comm.send_own_detection(own_targets)
                 else:
-                    self.comm.send_from_detection(friends, enemies, neutrals)
+                    # Legacy HSV-primary dual-color (TAG_PRIMARY=False)
+                    if enemies or neutrals or friends:
+                        self.comm.send_from_detection(friends, enemies, neutrals)
+                        min_fa = getattr(config, 'FRIEND_ALERT_AREA', 5000)
+                        if friends and friends[0].area >= min_fa:
+                            bt = friends[0]
+                            bt_type = 'F'
+                        elif getattr(config, 'PRIORITY_MODE', 'collect') != 'collect':
+                            bt = (enemies or neutrals)[0] if (enemies or neutrals) else friends[0]
+                            bt_type = 'E' if enemies else ('N' if neutrals else 'F')
+                        else:
+                            bt = (neutrals or enemies)[0] if (neutrals or enemies) else friends[0]
+                            bt_type = 'N' if neutrals else ('E' if enemies else 'F')
+                        self._holdover_target = (bt_type, bt.cx, bt.cy, bt.area, bt.direction)
+                        self._holdover_frames = 0
+                    elif self._holdover_target and self._holdover_frames < self._holdover_max:
+                        ht, hcx, hcy, ha, hd = self._holdover_target
+                        ha = int(ha * self._holdover_decay)
+                        self._holdover_target = (ht, hcx, hcy, ha, hd)
+                        self._holdover_frames += 1
+                        self.comm.send_target(ht, hcx, hcy, ha, hd)
+                    else:
+                        self._holdover_target = None
+                        self.comm.send_from_detection(friends, enemies, neutrals)
                 t_uart = time.perf_counter()
 
                 self._tx_count += 1
@@ -665,6 +766,12 @@ class VisionSystem:
                 dt_ms = (time.perf_counter() - t0) * 1000
 
                 # 7. 检测日志
+                if self._holdover_frames > 0 and self._holdover_target:
+                    ht, hcx, hcy, ha, hd = self._holdover_target
+                    det_logger.info(
+                        'HOLD %s cx=%d dir=%+.2f area=%d f=%d/%d',
+                        ht, hcx, hd, ha,
+                        self._holdover_frames, self._holdover_max)
                 if own_only:
                     if pt:
                         det_logger.info(
@@ -726,7 +833,7 @@ class VisionSystem:
                 # 9. 流媒体 [计时: anno + stream]
                 t_anno_start = time.perf_counter()
                 t_anno_end = t_anno_start
-                if self.stream and self._stream_server and frame_idx % 3 == 0:
+                if self.stream and self._stream_server and frame_idx % self._stream_every_n == 0:
                     if own_only:
                         annotated = self.detector.draw_targets(
                             frame.copy(), own_targets, self.comm.my_color)
@@ -828,16 +935,23 @@ class VisionSystem:
         """清空 Tracker 旧轨迹 (掉台进出 / 模式切换时调用)"""
         tr = getattr(self.detector, '_tracker', None)
         if tr:
-            tr._tracks.clear()
-            tr._next_id = 0
+            tr.clear()
         self.detector._last_max_area = 0
+
+    def _reset_detection_state(self):
+        """B2: 统一重置检测状态 — 模式切换/掉台进出/相机重连时调用"""
+        self._drop_sending_G = False
+        self._drop_confirm_count = 0
+        self.detector.reset_drop_ema()
+        self._last_tags = []
+        self._clear_tracker()
+        self._last_sent_type = 'X'
+        self._holdover_target = None
+        self._holdover_frames = 0
 
     def _on_camera_reconnect(self):
         """相机重连回调: 清除 Tracker 旧轨迹 + 重置 EMA + 恢复动态 WB"""
-        if self.detector._tracker:
-            self.detector._tracker._tracks.clear()
-            self.detector._tracker._next_id = 0
-        self.detector._last_max_area = 0
+        self._clear_tracker()
         self._last_tags = []
         # 重连后恢复当前颜色对应的 WB (运行中可能已切换)
         if self.camera.cap and config.AUTO_WB == 0:
@@ -865,29 +979,17 @@ class VisionSystem:
         extra = ''
         if cmd == 'N':
             self._drop_start_time = 0.0
-            self._drop_sending_G = False
-            self._drop_confirm_count = 0
-            self.detector.reset_drop_ema()
-            self._last_tags = []
-            self._clear_tracker()
+            self._reset_detection_state()
             self.comm.active = True
             self.comm.drop_recovery = False
             extra = ' → RESET TO NORMAL DETECT'
         elif cmd == 'D':
             self._drop_start_time = time.time()
-            self._drop_sending_G = False
-            self._drop_confirm_count = 0
-            self.detector.reset_drop_ema()
-            self._last_tags = []
-            self._clear_tracker()
+            self._reset_detection_state()
             extra = ' → DROP RECOVERY MODE'
         elif cmd in ('s', 'S'):
             self._drop_start_time = 0.0
-            self._drop_sending_G = False
-            self._drop_confirm_count = 0
-            self.detector.reset_drop_ema()
-            self._last_tags = []
-            self._clear_tracker()
+            self._reset_detection_state()
             if not self.comm.drop_recovery:
                 extra = ' → NORMAL DETECT MODE'
 
@@ -977,7 +1079,7 @@ def main():
     parser.add_argument('--priority-mode', choices=['collect', 'attack'],
                         default=None)
     parser.add_argument('--no-stream', action='store_true',
-                        help='Disable MJPEG stream server')
+                        help='Disable MJPEG stream (env VISION_STREAM=1 overrides)')
     parser.add_argument('--stream-port', type=int, default=8080,
                         help='MJPEG stream port (default: 8080)')
     parser.add_argument('--tag-backend', choices=['qr', 'aruco', 'apriltag'],
@@ -1017,11 +1119,13 @@ def main():
         except Exception as e:
             print(f'[WARN] config.snapshot() failed: {e}')
 
+    # VISION_STREAM=1 env var overrides --no-stream (runtime toggle)
+    use_stream = os.environ.get('VISION_STREAM', '') == '1' or not args.no_stream
     vision = VisionSystem(
         debug=args.debug,
         calibrate=args.calibrate,
         use_uart=not args.no_uart,
-        stream=not args.no_stream,
+        stream=use_stream,
         stream_port=args.stream_port,
         tag_backend=args.tag_backend,
     )

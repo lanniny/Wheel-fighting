@@ -120,6 +120,7 @@ class FusedDetector:
         self._hsv_only_drop_count = 0
         self._friend_trust_drop_count = 0
         self._color_conflict_count = 0
+        self._dist_filter_log_count = 0
 
         # P1 (2026-05-22): 温度降级开关. True 时 detect() 跳过 ONNX 推理
         # 走纯 HSV 通路, 由 ThermalGuard 周期调 set_throttled() 切换
@@ -205,7 +206,7 @@ class FusedDetector:
             self._onnx_empty_streak += 1
             self._onnx_good_streak = 0  # 打断恢复计数
             if self._onnx_empty_streak == self._ONNX_EMPTY_THRESH:
-                relaxed = max(2000, self._hsv_only_min_area_default // 3)
+                relaxed = max(800, self._hsv_only_min_area_default // 3)
                 print(f'[fused_detector] ONNX empty x{self._onnx_empty_streak} '
                       f'→ auto-relax hsv_only_min={self.hsv_only_min_area}'
                       f'→{relaxed}', flush=True)
@@ -237,14 +238,14 @@ class FusedDetector:
         self._thermal_throttled = bool(throttled)
         if old != self._thermal_throttled:
             if self._thermal_throttled:
-                self.hsv_only_min_area = max(2000, self._hsv_only_min_area_default // 3)
+                self.hsv_only_min_area = max(800, self._hsv_only_min_area_default // 3)
                 self._onnx_empty_streak = 0
                 self._onnx_good_streak = 0
                 mode = 'HSV-ONLY (ONNX skipped)'
             else:
                 # 恢复时不立即拉回6000! 保持宽松阈值直到 ONNX 稳定产出
                 # (warmup + 初始几帧 ONNX 结果不稳定, 防 6000 杀目标)
-                self.hsv_only_min_area = max(2000, self._hsv_only_min_area_default // 3)
+                self.hsv_only_min_area = max(800, self._hsv_only_min_area_default // 3)
                 self._throttle_warmup = 3
                 self._onnx_empty_streak = 0
                 self._onnx_good_streak = 0
@@ -403,8 +404,6 @@ class FusedDetector:
             filtered = [f for f in trusted_friends if f.area >= self.friend_min_area]
             dropped = len(trusted_friends) - len(filtered)
             if dropped > 0:
-                if not hasattr(self, '_dist_filter_log_count'):
-                    self._dist_filter_log_count = 0
                 self._dist_filter_log_count += 1
                 if self._dist_filter_log_count % 30 == 1:
                     print(f'[fused] distance filter dropped {dropped} far friend(s) '

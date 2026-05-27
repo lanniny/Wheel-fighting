@@ -7,6 +7,28 @@ import os
 import numpy as np
 import subprocess
 
+
+def _safe_int(env_key, default):
+    val = os.environ.get(env_key)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        print(f'[config] WARN: invalid {env_key}={val!r}, using default {default}')
+        return default
+
+
+def _safe_float(env_key, default):
+    val = os.environ.get(env_key)
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        print(f'[config] WARN: invalid {env_key}={val!r}, using default {default}')
+        return default
+
 # ============ 摄像头自动探测 ============
 def find_camera():
     """自动查找 USB 摄像头设备号, 优先环境变量"""
@@ -38,14 +60,14 @@ def find_camera():
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
-CAMERA_FOURCC = os.environ.get('VISION_FOURCC', 'MJPG')  # MJPG=硬解, YUYV=软解
+CAMERA_FOURCC = os.environ.get('VISION_FOURCC', 'YUYV')  # YUYV=稳定不卡死(300帧零故障); MJPG=快但USB Hub上反复hang
 
 # ============ 白平衡 ============
 AUTO_WB = int(os.environ.get('VISION_AUTO_WB', '0'))       # 0=固定WB, 1=自动WB
 # 统一使用 4200K 冷色温 (蓝/黄队通用)
 # 原因: WB>4600K 会导致蓝色能量块 H 偏移到黄色范围, 造成严重误检
 # 实测: WB=4200K 蓝色检出8.2% 黄色误检2.2%(被排斥掩码消除)
-WB_TEMPERATURE = int(os.environ.get('VISION_WB_TEMP', '4200'))
+WB_TEMPERATURE = _safe_int('VISION_WB_TEMP', 4200)
 WB_BLUE = 4200   # 蓝队色温 (保留兼容)
 WB_YELLOW = 4200  # 黄队色温 (原6000K→4200K, 修复蓝色误检为黄色)
 
@@ -109,17 +131,17 @@ def setup_camera(cap):
 
 # ============ HSV 颜色阈值 ============
 HSV_BLUE = {
-    'lower': np.array([100, 60, 40]),
-    'upper': np.array([130, 255, 255]),
+    'lower': np.array([85, 50, 25]),
+    'upper': np.array([125, 255, 255]),
 }
 
 HSV_YELLOW = {
-    'lower': np.array([22, 80, 40]),
-    'upper': np.array([42, 255, 255]),
+    'lower': np.array([22, 55, 40]),
+    'upper': np.array([48, 255, 255]),
 }
 # 黄色二阶段验证: 轮廓内 S 均值必须 > 此值, 否则判为蓝色冒充
 # (Realtek相机在WB=6000K下: 黄色S≈134, 蓝色S≈97, 阈值120分离)
-YELLOW_S_MEAN_MIN = int(os.environ.get('VISION_YELLOW_S_MEAN', '70'))
+YELLOW_S_MEAN_MIN = _safe_int('VISION_YELLOW_S_MEAN', 0)
 
 HSV_WHITE = {
     'lower': np.array([0, 0, 230]),
@@ -132,21 +154,22 @@ DETECT_WHITE = os.environ.get('VISION_DETECT_WHITE', '1') != '0'
 WHITE_EXCL_DILATE = int(os.environ.get('VISION_WHITE_EXCL_DILATE', '30'))
 
 # ============ 检测参数 ============
-MIN_CONTOUR_AREA = 600
-MIN_CONTOUR_AREA_YELLOW = int(os.environ.get('VISION_YELLOW_MIN_AREA', '600'))    # 降低下限, 检测远距离窄条黄色
-MAX_CONTOUR_AREA_YELLOW = int(os.environ.get('VISION_YELLOW_MAX_AREA', '280000'))  # 与蓝色一致, 支持近距离大面积
+MIN_CONTOUR_AREA = 1000   # 600→1000, 减少环境小噪点误检 (纯HSV模式)
+MIN_CONTOUR_AREA_YELLOW = _safe_int('VISION_YELLOW_MIN_AREA', 1000)
+MAX_CONTOUR_AREA_YELLOW = _safe_int('VISION_YELLOW_MAX_AREA', 15000)
 MAX_CONTOUR_AREA = 280000   # 280000 ≈ 91% of 640×480, 支持近距离大面积色块
 MIN_ASPECT_RATIO = 0.3
 MAX_ASPECT_RATIO = 3.0
 MAX_TARGETS = 10
 
 # ============ 黄色增强过滤 (替代面积暴力阈值) ============
-YELLOW_CIRCULARITY_MIN = float(os.environ.get('VISION_YELLOW_CIRC', '0.25'))  # 圆度下限 (0.15→0.25, 过滤台面反光不规则形状)
+YELLOW_CIRCULARITY_MIN = float(os.environ.get('VISION_YELLOW_CIRC', '0.15'))  # 圆度下限
 YELLOW_H_STD_MAX = int(os.environ.get('VISION_YELLOW_H_STD', '25'))           # H通道标准差上限 (放宽, 斜面光照不均)
 FRAME_BOTTOM_EXCLUDE = float(os.environ.get('VISION_BOTTOM_EXCL', '0.12'))    # 忽略画面底部12%
 
 # ============ 友方近距离报警 (双色模式防误发F) ============
-FRIEND_ALERT_AREA = int(os.environ.get('VISION_FRIEND_ALERT', '5000'))  # 友方面积>此值才发F (15000→5000, 远距离F不触发后退)
+FRIEND_ALERT_AREA = _safe_int('VISION_FRIEND_ALERT', 800)
+FRIEND_ALERT_AREA_YELLOW = _safe_int('VISION_FRIEND_ALERT_Y', 3000)  # 黄色队友方门槛更高 (地板暖色调防误检)
 
 # ============ 串口通信 (支持环境变量覆盖) ============
 def _find_uart():
@@ -223,11 +246,25 @@ TRACKER_SMOOTHING = float(os.environ.get('VISION_TRACK_SMOOTH', '0.30'))
 TRACKER_MAX_DIST = int(os.environ.get('VISION_TRACK_MAXDIST', '100'))
 TRACKER_MAX_LOST = int(os.environ.get('VISION_TRACK_MAXLOST', '5'))
 TRACKER_PREDICT = os.environ.get('VISION_TRACK_PREDICT', '1') != '0'
-TRACKER_CONFIRM_FRAMES = int(os.environ.get('VISION_TRACK_CONFIRM', '2'))
+TRACKER_CONFIRM_FRAMES = _safe_int('VISION_TRACK_CONFIRM', 2)
 TRACKER_COLOR_SWITCH_FRAMES = int(os.environ.get('VISION_TRACK_COLOR_SWITCH', '5'))  # 颜色切换冷却帧数 (3→5, 防E↔F闪烁)
 
+# ============ UART 发送频率 (可配置化, 2026-05-25 从 comm.py 硬编码迁出) ============
+UART_NO_TARGET_INTERVAL = float(os.environ.get('VISION_NO_TARGET_INTERVAL', '0.05'))
+UART_TARGET_INTERVAL = float(os.environ.get('VISION_TARGET_INTERVAL', '0.050'))
+UART_FAST_INTERVAL = float(os.environ.get('VISION_FAST_INTERVAL', '0.033'))
+
+# ============ 目标丢失保持 (Holdover) ============
+LOST_TARGET_HOLDOVER_FRAMES = int(os.environ.get('VISION_HOLDOVER_FRAMES', '3'))
+LOST_TARGET_AREA_DECAY = float(os.environ.get('VISION_HOLDOVER_AREA_DECAY', '0.7'))
+
+# ============ 智能优先级评分 ============
+PRIORITY_AREA_WEIGHT = float(os.environ.get('VISION_PRIORITY_AREA_W', '0.6'))
+PRIORITY_CENTER_WEIGHT = float(os.environ.get('VISION_PRIORITY_CENTER_W', '0.3'))
+PRIORITY_STABLE_WEIGHT = float(os.environ.get('VISION_PRIORITY_STABLE_W', '0.1'))
+
 # ============ 帧率控制 ============
-TARGET_FPS = int(os.environ.get('VISION_FPS', '30'))
+TARGET_FPS = _safe_int('VISION_FPS', 30)
 
 # ============ 检测模式 ============
 # False: 双色检测(蓝+黄全部检测, 分类友/敌) — 推荐, STM32 能区分 E/F/N
@@ -244,7 +281,7 @@ DISTANCE_NEAR  = 12000   # 面积 > 此值 = 近距离
 DISTANCE_FAR   = 3000    # 面积 < 此值 = 远距离
 
 # ============ Watchdog ============
-WATCHDOG_TIMEOUT = 30.0  # 连续无有效帧超时(s), 触发相机重启
+WATCHDOG_TIMEOUT = 5.0  # 连续无有效帧超时(s), 触发相机重启 (30→5, 比赛只有120s不能等30s)
 
 # ============ 检测优化 ============
 DETECT_HALF_RES = os.environ.get('VISION_HALF_RES', '1') != '0'  # 半分辨率检测
@@ -262,7 +299,7 @@ HSV_BLACK = {
 DROP_BLACK_RATIO_HIGH = float(os.environ.get('VISION_DROP_RATIO_HIGH', '0.55'))  # G 启动阈值 (0.50→0.55, 降低阴影误触发)
 DROP_BLACK_RATIO_LOW = float(os.environ.get('VISION_DROP_RATIO_LOW', '0.30'))    # G 退出阈值
 DROP_BLACK_RATIO_THRESHOLD = DROP_BLACK_RATIO_HIGH  # 兼容旧引用
-DROP_G_CONFIRM_FRAMES = int(os.environ.get('VISION_DROP_CONFIRM', '5'))  # 连续N帧超阈值才首次发G (3→5, 降低掉台误触发)
+DROP_G_CONFIRM_FRAMES = _safe_int('VISION_DROP_CONFIRM', 5)
 DROP_SEND_INTERVAL = float(os.environ.get('VISION_DROP_INTERVAL', '0.05'))  # 20Hz
 DROP_V_OFFSET = int(os.environ.get('VISION_DROP_V_OFFSET', '15'))  # P25 + offset for adaptive V threshold
 # 超时适配远程固件: SPIN+FORWARD(1000)+BACK(2000)+ESCAPE(850)≈4s/轮, 留5轮余量
@@ -285,7 +322,8 @@ STREAM_EVERY_N_FRAMES = int(os.environ.get('VISION_STREAM_EVERY', '3'))  # 每 N
 
 # ============ AprilTag 融合检测 ============
 TAG_DETECT_ENABLED = os.environ.get('VISION_TAG', '1') != '0'
-TAG_DETECT_INTERVAL = int(os.environ.get('VISION_TAG_INTERVAL', '3'))  # 全帧Tag扫描间隔 (仅无颜色目标时)
+TAG_DETECT_INTERVAL = _safe_int('VISION_TAG_INTERVAL', 1)  # 全帧Tag扫描间隔 (Tag-Primary模式每帧扫描)
+TAG_PRIMARY = os.environ.get('VISION_TAG_PRIMARY', '1') != '0'  # Tag主导: HSV无Tag确认→降级为N
 TAG_BACKEND = os.environ.get('VISION_TAG_BACKEND', 'apriltag')  # apriltag(推荐)/aruco/qr
 TAG_ID_NEUTRAL = 0   # 中立能量块
 TAG_ID_BLUE = 1      # 蓝方能量块
@@ -294,6 +332,9 @@ TAG_ROI_MARGIN = int(os.environ.get('VISION_TAG_ROI_MARGIN', '40'))    # ROI扩�
 TAG_ROI_MATCH_DIST = int(os.environ.get('VISION_TAG_MATCH_DIST', '50'))  # Tag-颜色匹配最大距离(px), 80→50 收紧避免方向偏差
 TAG_DECISION_MARGIN = float(os.environ.get('VISION_TAG_MARGIN', '30'))  # AprilTag decision_margin 最小值, 低于此值不信任
 ORPHAN_TAG_EDGE_MARGIN = int(os.environ.get('VISION_TAG_EDGE_MARGIN', '60'))  # 孤儿Tag边缘排除区(px), 防场外Tag误导
+
+# ============ Tag 辅助自适应 HSV (TAHSV) ============
+ADAPTIVE_HSV_ENABLED = os.environ.get('VISION_ADAPTIVE_HSV', '1') != '0'
 
 # ============ 标定文件自动加载 ============
 def _load_calibration():
@@ -349,14 +390,14 @@ FUSE_W_ONNX = float(os.environ.get('VISION_FUSE_W_ONNX', '0.7'))
 FUSE_MATCH_DIST_PX = int(os.environ.get('VISION_FUSE_MATCH_DIST', '80'))
 # 距离过滤: 远处疑似 friend (area<FRIEND_MIN_AREA) + 近处 enemy (>=ENEMY_NEAR_AREA)
 # 同时存在时, 过滤 friend 防止"远友 + 近敌"组合让机器人盲目后退
-FUSE_FRIEND_MIN_AREA = int(os.environ.get('VISION_FUSE_FRIEND_MIN_AREA', '5000'))
+FUSE_FRIEND_MIN_AREA = int(os.environ.get('VISION_FUSE_FRIEND_MIN_AREA', '2000'))
 FUSE_ENEMY_NEAR_AREA = int(os.environ.get('VISION_FUSE_ENEMY_NEAR_AREA', '6000'))
 
 # v3 (2026-05-21, HSV 远端误识别修复):
 # HSV-only 目标 (ONNX 未确认) 最小信任 area
 #   场景: 远端环境(地板/墙/反光)被 HSV 误识别为蓝/黄, ONNX 因不在训练分布不会检测,
 #   导致 fused 直接通过 HSV 假目标. 加 area 门槛过滤远端小目标.
-FUSE_HSV_ONLY_MIN_AREA = int(os.environ.get('VISION_FUSE_HSV_ONLY_MIN_AREA', '6000'))
+FUSE_HSV_ONLY_MIN_AREA = int(os.environ.get('VISION_FUSE_HSV_ONLY_MIN_AREA', '800'))
 
 # v4 (2026-05-21, 白色块误识别修复):
 # 白色 (中立能量块) HSV-only 特殊 area 阈值
@@ -456,6 +497,12 @@ def snapshot():
         f'  Detect   : detect_white={DETECT_WHITE} '
         f'white_excl_dilate={WHITE_EXCL_DILATE}px '
         f'dir_flip={DIRECTION_FLIP} circ_min={YELLOW_CIRCULARITY_MIN}',
+        f'  UART TX  : no_tgt={UART_NO_TARGET_INTERVAL}s '
+        f'tgt={UART_TARGET_INTERVAL}s fast={UART_FAST_INTERVAL}s',
+        f'  Holdover : frames={LOST_TARGET_HOLDOVER_FRAMES} '
+        f'decay={LOST_TARGET_AREA_DECAY}',
+        f'  Priority : area_w={PRIORITY_AREA_WEIGHT} '
+        f'center_w={PRIORITY_CENTER_WEIGHT} stable_w={PRIORITY_STABLE_WEIGHT}',
         f'  Protocol : v2={PROTOCOL_V2} echo={ECHO_ENABLED} '
         f'echo_timeout={ECHO_TIMEOUT}s',
         f'  Log      : {LOG_PATH} status_interval={STATUS_PRINT_INTERVAL_S}s',

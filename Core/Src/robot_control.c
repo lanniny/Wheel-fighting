@@ -76,6 +76,16 @@ void Robot_Control_Update(void)
                 Fight_InitWithDir(vdir);
                 robot_state = ROBOT_ATTACK;
             }
+            /* P4: 友方避让 — 漫游时视觉看到友方块, 后退转向避免推自己的块 */
+            else if (!Vision_IsTimeout() && vision_target.valid &&
+                     vision_target.type == 'F' &&
+                     vision_target.area > FIGHT_FRIEND_MIN_AREA)
+            {
+                if (vision_target.dir < 0)
+                    drive_user_defined(SPEED_TURN_M, -SPEED_TURN_M);
+                else
+                    drive_user_defined(-SPEED_TURN_M, SPEED_TURN_M);
+            }
             break;
 
         case ROBOT_ATTACK:

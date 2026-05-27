@@ -26,19 +26,16 @@ UART 通信模块 v4 - 自动重连 + 颜色心跳 + 炸弹类型支持 + 协议
 """
 import os
 import errno
+import glob
 import time
+import serial as _serial_mod
 import config
 
 
 class UartComm:
-    # 连续写错误超过此阈值则触发重连
     _TX_ERROR_THRESHOLD = 3
-    # 重连冷却: 指数退避 (2→4→8→8s)
     _RECONNECT_BASE = 2.0
     _RECONNECT_MAX = 8.0
-    # 颜色心跳周期 (s): 定期重发己方颜色，防止STM32丢失初始颜色
-    _COLOR_HEARTBEAT_INTERVAL = 5.0
-    # 设备存在性检查间隔 (s): 比发送频率低, 减少 stat() 系统调用
     _DEVICE_CHECK_INTERVAL = 3.0
 
     def __init__(self):
@@ -50,21 +47,24 @@ class UartComm:
         self._color_changed = False  # 颜色切换标志, 供主循环检测并切换WB
         self._last_send = 0.0
         self._last_dir = 0.0         # 上次发送方向 (自适应频率用)
-        self._send_interval = 0.050  # 最高 20Hz 发送频率
-        self._no_target_interval = 0.15  # 无目标时~7Hz (不能>=0.2, 否则触及STM32 200ms超时边界)
-        self._fast_interval = 0.033  # 快速运动时 30Hz
+        self._send_interval = getattr(config, 'UART_TARGET_INTERVAL', 0.050)
+        self._no_target_interval = getattr(config, 'UART_NO_TARGET_INTERVAL', 0.10)
+        self._fast_interval = getattr(config, 'UART_FAST_INTERVAL', 0.033)
         self._tx_errors = 0
         self._rx_errors = 0          # 读取错误计数
         self._last_reconnect = 0.0
         self._reconnect_backoff = self._RECONNECT_BASE
-        self._last_color_send = 0.0
         self._last_device_check = 0.0
         self._port_path = None       # 当前使用的设备路径
         # 发送统计
         self._tx_total = 0
         self._tx_success = 0
-        self._stats_timer = 0.0
+        self._stats_timer = time.time()
         self._STATS_INTERVAL = 60.0
+        self._p_received_ts = 0.0
+        self._last_sent_type = 'X'
+        self._tx_timeouts = 0        # consecutive timeout streak (reset on success)
+        self._tx_timeouts_window = 0  # C2: window counter for stats reporting
         # 方向平滑: 已由 Tracker EMA 处理, comm 层不再二次平滑
         # (双重平滑会增加方向响应延迟, 导致机器人追踪滞后)
         # RX 缓冲区: 累积接收数据, 分离回声帧和单字节命令
@@ -92,7 +92,7 @@ class UartComm:
                 port=port,
                 baudrate=config.UART_BAUD,
                 timeout=config.UART_TIMEOUT,
-                write_timeout=0.05,
+                write_timeout=0.015,
             )
             # 启用 low_latency 模式 (减少内核缓冲延迟)
             # 解析真实设备路径 (符号链接 → 实际设备)
@@ -118,10 +118,12 @@ class UartComm:
             # 清空残留数据 (USB 断联重连后可能有脏数据)
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
+            self._rx_buf = b''
             self._tx_errors = 0
             self._rx_errors = 0
-            self._reconnect_backoff = self._RECONNECT_BASE  # 重连成功, 重置退避
+            self._reconnect_backoff = self._RECONNECT_BASE
             self._last_device_check = time.time()
+            self._stats_timer = time.time()
             print(f'UART opened: {port} @ {config.UART_BAUD} (low_latency)')
             return True
         except Exception as e:
@@ -146,11 +148,17 @@ class UartComm:
         if now - self._last_reconnect < self._reconnect_backoff:
             return
         self._last_reconnect = now
-        import glob
-        has_usb = bool(glob.glob('/dev/ttyUSB*'))
-        has_acm = bool(glob.glob('/dev/ttyACM*'))
-        has_sym = os.path.exists('/dev/ttySTM32')
-        if not (has_usb or has_acm or has_sym):
+        # 检查当前配置的设备是否存在 (板载UART/USB/符号链接)
+        has_device = False
+        if self._port_path and os.path.exists(self._port_path):
+            has_device = True
+        if not has_device:
+            has_usb = bool(glob.glob('/dev/ttyUSB*'))
+            has_acm = bool(glob.glob('/dev/ttyACM*'))
+            has_sym = os.path.exists('/dev/ttySTM32')
+            has_as = bool(glob.glob('/dev/ttyAS*'))
+            has_device = has_usb or has_acm or has_sym or has_as
+        if not has_device:
             self._reconnect_backoff = min(
                 self._reconnect_backoff * 2, self._RECONNECT_MAX)
             return
@@ -205,7 +213,9 @@ class UartComm:
             self.drop_recovery = False
             return 's'
         if ch == 'p':
+            print('[UART] WARNING: received p cmd → active=False (noise?)', flush=True)
             self.active = False
+            self._p_received_ts = time.time()
             return ch
         if ch == 'D':
             self.drop_recovery = True
@@ -309,7 +319,8 @@ class UartComm:
                 self._try_reconnect()
                 self._rx_errors = 0
             return commands
-        except Exception:
+        except Exception as e:
+            print(f'[UART] RX unexpected: {e!r}', flush=True)
             return commands
 
         # 防止缓冲区溢出 (丢弃旧数据)
@@ -417,18 +428,25 @@ class UartComm:
         target_id:  Tracker 提供的稳定 ID, None=0 (未跟踪)
         """
         if not self.active:
-            return
+            p_ts = self._p_received_ts
+            if p_ts > 0 and (time.time() - p_ts) > 3.0:
+                print('[UART] Auto-recover active after 3s p-timeout', flush=True)
+                self.active = True
+                self._p_received_ts = 0
+            else:
+                return
 
-        # 自适应发送频率: 目标运动快→30Hz, 慢→20Hz, 无目标→5Hz
         now = time.time()
-        if target_type == 'X':
-            interval = self._no_target_interval
-        else:
-            dir_delta = abs(direction - self._last_dir)
-            interval = self._fast_interval if dir_delta > 0.05 else self._send_interval
+        type_changed = (target_type != self._last_sent_type)
 
-        if now - self._last_send < interval:
-            return
+        if not type_changed:
+            if target_type == 'X':
+                interval = self._no_target_interval
+            else:
+                dir_delta = abs(direction - self._last_dir)
+                interval = self._fast_interval if dir_delta > 0.05 else self._send_interval
+            if now - self._last_send < interval:
+                return
 
         # 串口不可用 或 设备消失 → 重连
         if not self.ser or not self._check_device_alive():
@@ -456,13 +474,17 @@ class UartComm:
             self._last_send = now
             self._last_tx_ts = now
             self._last_dir = direction
+            self._last_sent_type = target_type
             self._tx_errors = 0
+            self._tx_timeouts = 0
             self._tx_success += 1
+        except _serial_mod.SerialTimeoutException:
+            self._tx_timeouts += 1
+            self._tx_timeouts_window += 1
+            if self._tx_timeouts % 50 == 1:
+                print(f'[UART] Write timeout #{self._tx_timeouts} '
+                      f'(USB busy, skipping)', flush=True)
         except OSError as e:
-            # v2 (C4): USB 断开 → 立即重连, 用 errno 常量替代硬编码
-            #   EIO (5)    : I/O error (设备物理拔出)
-            #   ENXIO (6)  : 无此设备或地址
-            #   ENODEV (19): 设备不存在 (常见于热拔插)
             self._tx_errors += 1
             err_no = getattr(e, 'errno', 0)
             device_err_set = (errno.EIO, errno.ENXIO, errno.ENODEV)
@@ -484,9 +506,11 @@ class UartComm:
             rate = (self._tx_success / self._tx_total * 100
                     if self._tx_total > 0 else 0)
             print(f'[UART] Stats: {self._tx_success}/{self._tx_total} '
-                  f'({rate:.1f}%) in {self._STATS_INTERVAL:.0f}s')
+                  f'({rate:.1f}%) timeouts={self._tx_timeouts_window} '
+                  f'in {self._STATS_INTERVAL:.0f}s')
             self._tx_total = 0
             self._tx_success = 0
+            self._tx_timeouts_window = 0
             self._stats_timer = now
 
     # ------------------------------------------------------------------
@@ -515,18 +539,21 @@ class UartComm:
 
     def send_from_detection(self, friends, enemies, neutrals, bombs=None):
         """
-        根据优先级发送最重要目标, 尊重 config.PRIORITY_MODE:
-          炸弹(B) 始终最优先
-          collect 模式: N(中立) > E(敌方)
-          attack  模式: E(敌方) > N(中立)
-          无目标 → X
-
-        bombs: 炸弹目标列表 (可选, 当前为保留接口)
+        优先级: B(炸弹) > F(近距离友方) > E/N(按模式) > X
+        近距离友方必须优先于敌方, 否则机器人会穿过友方块去攻击敌人。
         """
         if bombs:
             t = bombs[0]
             self.send_target('B', t.cx, t.cy, t.area, t.direction)
             return
+
+        # 近距离友方最高优先 (area >= FRIEND_ALERT_AREA)
+        if friends:
+            t = friends[0]
+            min_area = getattr(config, 'FRIEND_ALERT_AREA', 5000)
+            if t.area >= min_area:
+                self.send_target('F', t.cx, t.cy, t.area, t.direction)
+                return
 
         mode = getattr(config, 'PRIORITY_MODE', 'collect')
         if mode == 'collect':
@@ -542,14 +569,5 @@ class UartComm:
         elif second:
             t = second[0]
             self.send_target(second_type, t.cx, t.cy, t.area, t.direction)
-        elif friends:
-            # 双色模式: 友方 area >= FRIEND_ALERT_AREA 才发 F
-            # 远距离友方不触发后退, 避免机器人因远处己方块误退
-            t = friends[0]
-            min_area = getattr(config, 'FRIEND_ALERT_AREA', 5000)
-            if t.area >= min_area:
-                self.send_target('F', t.cx, t.cy, t.area, t.direction)
-            else:
-                self.send_target('X')
         else:
             self.send_target('X')
