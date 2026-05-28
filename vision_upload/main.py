@@ -370,8 +370,23 @@ class VisionSystem:
                         print(f'\n[WATCHDOG] No valid frame for '
                               f'{self._watchdog_timeout:.0f}s, restarting camera...')
                         self.camera.release()
-                        self.camera.open()
-                        self._last_valid_frame = time.time()
+                        # B3修复(2026-05-29): 检查open()返回值, 成功才reset看门狗计时+清Tracker;
+                        # 失败则退避(拉长下次重启间隔), 防相机故障时无效反复 release/open。
+                        if self.camera.open():
+                            self._last_valid_frame = time.time()
+                            self._watchdog_fail = 0
+                            if self.camera.on_reconnect:
+                                self.camera.on_reconnect()
+                        else:
+                            self._watchdog_fail = getattr(
+                                self, '_watchdog_fail', 0) + 1
+                            print(f'[WATCHDOG] camera reopen FAILED '
+                                  f'(#{self._watchdog_fail}), backing off',
+                                  flush=True)
+                            # 退避: 把计时往前挪, 使下次 watchdog 在 backoff 秒后再触发
+                            backoff = min(5.0 * self._watchdog_fail, 15.0)
+                            self._last_valid_frame = (
+                                time.time() - self._watchdog_timeout + backoff)
                     time.sleep(0.05)
                     next_frame = time.perf_counter() + frame_dt
                     continue
@@ -379,21 +394,33 @@ class VisionSystem:
 
                 # 3. 掉台回复模式: 黑色(台面)检测
                 if self.comm.drop_recovery:
-                    # 超时保护: 防止永久卡在掉台回复模式
-                    drop_timeout = getattr(config, 'DROP_RECOVERY_TIMEOUT', 25.0)
+                    # 硬超时兜底(2026-05-29 C2修复): 退出掉台模式的权力交给STM32的'S'命令
+                    # (STM32侧已改为 Backup_IsDone 后周期重发S, 可靠送达)。本地超时仅作
+                    # "S永久丢失"的硬兜底: 25s→90s(比赛120s内, 正常回台<10s远不触及)。
+                    # 原bug(F4): 25s就切回正常检测发F/E/N, 回台>25s时会污染STM32 Backup状态机。
+                    # 注: 硬超时前持续按黑检测G/X迟滞辅助, 不切回发F/E/N(避免STM32误确认陷阱)。
+                    drop_timeout = getattr(config, 'DROP_RECOVERY_HARD_TIMEOUT', 90.0)
                     if self._drop_start_time <= 0:
                         self._drop_start_time = time.time()
                     drop_elapsed = time.time() - self._drop_start_time
 
                     if drop_elapsed >= drop_timeout:
-                        # 超时自动退出掉台模式, 恢复正常颜色检测
-                        # 不再无限等待STM32发'S', 否则机器人永远卡在盲冲
-                        print(f'[DROP] AUTO-EXIT after {drop_elapsed:.1f}s timeout '
-                              f'(STM32 never sent S)', flush=True)
-                        det_logger.info('DROP_AUTO_EXIT %.1fs (forced)', drop_elapsed)
+                        # 硬超时: STM32的S可能永久丢失, 彻底退出防整局卡死
+                        print(f'[DROP] HARD-EXIT after {drop_elapsed:.1f}s '
+                              f'(S never received, failsafe)', flush=True)
+                        det_logger.info('DROP_HARD_EXIT %.1fs (failsafe)', drop_elapsed)
                         self.comm.drop_recovery = False
                         self._drop_start_time = 0.0
                         self._reset_detection_state()
+                        # B4修复: 显式收尾发X + continue, 不再靠本帧继续跑掉台分支"碰巧"只发X
+                        if self.use_uart:
+                            self.comm.force_send_now()
+                            self.comm.send_target('X')
+                        self._update_fps()
+                        frame_idx += 1
+                        self._sleep_until(next_frame)
+                        next_frame += frame_dt
+                        continue
 
                     ratio, bcx, bcy, bdir, dbg = self.detector.detect_black_ratio(frame)
                     t_det = time.perf_counter()
@@ -404,6 +431,34 @@ class VisionSystem:
                     th_high = getattr(config, 'DROP_BLACK_RATIO_HIGH', 0.50)
                     th_low = getattr(config, 'DROP_BLACK_RATIO_LOW', 0.30)
                     confirm_n = getattr(config, 'DROP_G_CONFIRM_FRAMES', 3)
+
+                    # C2-F1修复(2026-05-29, 烛对抗复核): ratio持续低于LOW(机器人已稳定在
+                    # 台面中央)→自主退出drop, 不死等STM32的'S'。覆盖"S被噪声吞但已实际上台"场景,
+                    # 避免最长90s硬超时前只发G/X的瞎眼(F1: 不把视觉安全押在未落地的STM32重发S假设)。
+                    stable_exit_s = getattr(config, 'DROP_STABLE_EXIT_S', 10.0)
+                    if ratio < th_low:
+                        if getattr(self, '_drop_low_start', 0.0) <= 0:
+                            self._drop_low_start = time.time()
+                        low_dur = time.time() - self._drop_low_start
+                    else:
+                        self._drop_low_start = 0.0
+                        low_dur = 0.0
+                    if low_dur >= stable_exit_s:
+                        print(f'[DROP] STABLE-EXIT: ratio<LOW {low_dur:.1f}s '
+                              f'(recovered, no S needed)', flush=True)
+                        det_logger.info('DROP_STABLE_EXIT %.1fs', low_dur)
+                        self.comm.drop_recovery = False
+                        self._drop_start_time = 0.0
+                        self._drop_low_start = 0.0
+                        self._reset_detection_state()
+                        if self.use_uart:
+                            self.comm.force_send_now()
+                            self.comm.send_target('X')
+                        self._update_fps()
+                        frame_idx += 1
+                        self._sleep_until(next_frame)
+                        next_frame += frame_dt
+                        continue
 
                     if self._drop_sending_G:
                         # 已在发G: 低于下限则立即退出
@@ -578,7 +633,15 @@ class VisionSystem:
                                   reverse=True)
                         self._last_tags = tags
                         if tags:
-                            tag_standalone = tags[0]
+                            # 己方(F) Tag 优先: 回避=安全优先, 防撞己方犯规;
+                            # 无己方 Tag 才退回最大面积 Tag (2026-05-29)。
+                            # tags 已按面积降序, own_tags[0] 即最大的己方 Tag。
+                            own_tags = [
+                                tg for tg in tags
+                                if TagDetector.classify_tag(
+                                    tg['id'], self.comm.my_color) == 'F']
+                            tag_standalone = (own_tags[0] if own_tags
+                                              else tags[0])
                 else:
                     # ── Legacy: HSV+Tag 融合 (TAG_PRIMARY=False) ──
                     tag_standalone = None
@@ -676,6 +739,24 @@ class VisionSystem:
                     self.comm.force_send_now()
                 self._last_sent_type = 'T' if _has_target else 'X'
 
+                # B1修复(2026-05-29): TAG_PRIMARY下"己方避让"(Tag-F或HSV-F)安全最高优先。
+                # 防"敌方Tag被识别 + 己方块仅HSV可见(apriltag没认出)"时, 下面 tag_standalone
+                # (非己方)抢先发E、跳过HSV-F避让兜底 → 撞己方块犯规。己方色HSV块够大即优先发F。
+                # (己方Tag已会发F, 故仅在 tag_standalone 非己方时才用HSV兜底)
+                primary_hsv_friend = None
+                if (getattr(config, 'TAG_PRIMARY', True) and not collect_mode
+                        and own_targets):
+                    if self.comm.my_color == 'y':
+                        _min_fa = getattr(config, 'FRIEND_ALERT_AREA_YELLOW', 6000)
+                    else:
+                        _min_fa = getattr(config, 'FRIEND_ALERT_AREA', 6000)
+                    ts_is_own = (
+                        tag_standalone is not None
+                        and TagDetector.classify_tag(
+                            tag_standalone['id'], self.comm.my_color) == 'F')
+                    if own_targets[0].area >= _min_fa and not ts_is_own:
+                        primary_hsv_friend = own_targets[0]
+
                 # 优先级: Tag分类 > 颜色分类 (Tag是地面真值, 颜色可能误判)
                 if collect_mode:
                     if tags:
@@ -688,6 +769,12 @@ class VisionSystem:
                                           pt.cx, pt.cy, pt.area, pt.direction)
                     self._holdover_target = (tag_type_override, pt.cx, pt.cy, pt.area, pt.direction)
                     self._holdover_frames = 0
+                elif primary_hsv_friend is not None:
+                    # B1: 己方HSV块避让优先于非己方Tag (安全优先, 防撞己方犯规)
+                    t = primary_hsv_friend
+                    self.comm.send_target('F', t.cx, t.cy, t.area, t.direction)
+                    self._holdover_target = ('F', t.cx, t.cy, t.area, t.direction)
+                    self._holdover_frames = 0
                 elif tag_standalone:
                     self._send_tag_target(tag_standalone)
                     self._holdover_target = None
@@ -696,9 +783,9 @@ class VisionSystem:
                     # STM32 只处理 F, 其他类型无意义
                     # 黄色队用更高门槛 (地板暖色调容易误检为黄色)
                     if self.comm.my_color == 'y':
-                        min_fa = getattr(config, 'FRIEND_ALERT_AREA_YELLOW', 3000)
+                        min_fa = getattr(config, 'FRIEND_ALERT_AREA_YELLOW', 6000)
                     else:
-                        min_fa = getattr(config, 'FRIEND_ALERT_AREA', 800)
+                        min_fa = getattr(config, 'FRIEND_ALERT_AREA', 6000)
                     if own_targets and own_targets[0].area >= min_fa:
                         t = own_targets[0]
                         self.comm.send_target('F', t.cx, t.cy,
@@ -790,8 +877,9 @@ class VisionSystem:
                     if pt:
                         det_logger.info(
                             'DET cx=%d cy=%d area=%d dir=%+.2f '
-                            'E=%d N=%d F=%d%s %.0fms',
+                            'sent=%s E=%d N=%d F=%d%s %.0fms',
                             pt.cx, pt.cy, int(pt.area), pt.direction,
+                            self.comm.last_sent_type,
                             len(enemies), len(neutrals), len(friends),
                             tag_info, dt_ms)
                     elif tag_standalone:
@@ -826,6 +914,7 @@ class VisionSystem:
                             tag_s = f' T:id{tag_standalone["id"]}'
                         print(f'[{self._fps:5.1f}fps {dt_ms:4.1f}ms] '
                               f'UART:{uart_s} TX:{self._tx_count} '
+                              f'SENT:{self.comm.last_sent_type} '
                               f'E:{len(enemies)} N:{len(neutrals)} '
                               f'F:{len(friends)}{tag_s}', flush=True)
                     self._last_status_print_ts = now_print
@@ -942,6 +1031,7 @@ class VisionSystem:
         """B2: 统一重置检测状态 — 模式切换/掉台进出/相机重连时调用"""
         self._drop_sending_G = False
         self._drop_confirm_count = 0
+        self._drop_low_start = 0.0  # C2-F1: 稳定退出计时(ratio持续低于LOW的起点)
         self.detector.reset_drop_ema()
         self._last_tags = []
         self._clear_tracker()
@@ -960,17 +1050,18 @@ class VisionSystem:
         print(f'[CAMERA] Reconnected, Tracker cleared, WB={config.WB_TEMPERATURE}K')
 
     def _send_tag_target(self, tag):
-        """将 Tag 检测结果分类并发送给 STM32"""
+        """将 Tag 检测结果分类并发送给 STM32。
+
+        Tag 是 ground truth (apriltag decision_margin 已过滤误检),
+        识别到即按类型发送, 不再设面积门槛 (2026-05-29 修复 F2:
+        原先复用颜色块的 FRIEND_ALERT_AREA=6000 过滤 Tag 角点面积 tw*th,
+        量纲错配导致稍远的己方 Tag 被降级为 X, F 永远发不出去)。
+        """
         t_type = TagDetector.classify_tag(tag['id'], self.comm.my_color)
         direction = (tag['cx'] - config.CAMERA_WIDTH / 2) / (config.CAMERA_WIDTH / 2)
         if getattr(config, 'DIRECTION_FLIP', False):
             direction = -direction
         area = tag.get('area', 0)
-        if t_type == 'F':
-            min_area = getattr(config, 'FRIEND_ALERT_AREA', 5000)
-            if area < min_area:
-                self.comm.send_target('X')
-                return 'X'
         self.comm.send_target(t_type, tag['cx'], tag['cy'], area, direction)
         return t_type
 

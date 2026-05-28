@@ -790,6 +790,7 @@ class TagDetector:
 
     def __init__(self, backend=None):
         self.backend = backend or getattr(config, 'TAG_BACKEND', 'apriltag')
+        self._tag_err_count = 0  # B2(2026-05-29): Tag检测异常计数(限频告警用)
         if self.backend == 'qr':
             self._qr = cv2.QRCodeDetector()
         elif self.backend == 'apriltag':
@@ -831,6 +832,15 @@ class TagDetector:
             print(f'[WARN] aruco backend unavailable: {e}, falling back to QR')
             self.backend = 'qr'
             self._qr = cv2.QRCodeDetector()
+
+    def _tag_err_warn(self, e, where):
+        """B2(2026-05-29): Tag检测异常限频告警, 替代裸except静默吞掉。
+        让赛场能从日志区分'视野里没有Tag'与'AprilTag/aruco引擎崩溃'。
+        """
+        self._tag_err_count += 1
+        if self._tag_err_count % 30 == 1:
+            print(f'[TAG][WARN] {where} detect error #{self._tag_err_count}: '
+                  f'{type(e).__name__}: {e}', flush=True)
 
     def detect_tags(self, frame):
         """
@@ -878,7 +888,8 @@ class TagDetector:
             if self.backend == 'apriltag':
                 try:
                     results = self._at.detect(roi)
-                except Exception:
+                except Exception as e:
+                    self._tag_err_warn(e, 'roi-apriltag')
                     continue
                 min_margin = getattr(config, 'TAG_DECISION_MARGIN', 30)
                 for r in results:
@@ -898,7 +909,8 @@ class TagDetector:
                     else:
                         corners, ids, _ = cv2.aruco.detectMarkers(
                             roi, self._aruco_dict, parameters=self._aruco_params)
-                except Exception:
+                except Exception as e:
+                    self._tag_err_warn(e, 'roi-aruco')
                     continue
                 if ids is None:
                     continue
@@ -931,7 +943,8 @@ class TagDetector:
             else:
                 corners, ids, _ = cv2.aruco.detectMarkers(
                     gray, self._aruco_dict, parameters=self._aruco_params)
-        except Exception:
+        except Exception as e:
+            self._tag_err_warn(e, 'aruco')
             return []
         tags = []
         if ids is not None:
@@ -949,7 +962,8 @@ class TagDetector:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         try:
             results = self._at.detect(gray)
-        except Exception:
+        except Exception as e:
+            self._tag_err_warn(e, 'apriltag')
             return []
         tags = []
         min_margin = getattr(config, 'TAG_DECISION_MARGIN', 30)

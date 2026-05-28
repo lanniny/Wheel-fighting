@@ -211,7 +211,7 @@ class UartComm:
         if ch == 's' or ch == 'S':
             self.active = True
             self.drop_recovery = False
-            return 's'
+            return ch  # 2026-05-29: 保留原始大小写(s=开始/S=掉台恢复, 语义未来可区分)
         if ch == 'p':
             print('[UART] WARNING: received p cmd → active=False (noise?)', flush=True)
             self.active = False
@@ -398,6 +398,12 @@ class UartComm:
     def tx_errors(self):
         """当前连续发送错误计数"""
         return self._tx_errors
+
+    @property
+    def last_sent_type(self):
+        """最近一次实际写入串口的目标类型 (节流跳过时保持上次值)。
+        供主循环日志显示真实发送 type, 避免误读 friends/enemies 计数。"""
+        return self._last_sent_type
 
     def force_send_now(self):
         """强制下一次 send_target 立即发送 (跳过频率限制)。

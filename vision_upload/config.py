@@ -303,12 +303,30 @@ DROP_G_CONFIRM_FRAMES = _safe_int('VISION_DROP_CONFIRM', 5)
 DROP_SEND_INTERVAL = float(os.environ.get('VISION_DROP_INTERVAL', '0.05'))  # 20Hz
 DROP_V_OFFSET = int(os.environ.get('VISION_DROP_V_OFFSET', '15'))  # P25 + offset for adaptive V threshold
 # 超时适配远程固件: SPIN+FORWARD(1000)+BACK(2000)+ESCAPE(850)≈4s/轮, 留5轮余量
+# (已废弃 2026-05-29 C2修复): 原25s软超时"切回正常检测发F/E/N"逻辑会在回台>25s时
+# 污染STM32 Backup状态机(它仍在等G), 已移除。退出掉台权改由STM32的'S'命令
+# (STM32侧Backup_IsDone后周期重发S可靠送达) + 下面的硬超时兜底控制。
+# 本变量保留仅作兼容, 当前主循环不再引用。
 DROP_RECOVERY_TIMEOUT = float(os.environ.get('VISION_DROP_TIMEOUT', '25.0'))
+# 硬超时兜底(C2修复): STM32的'S'若永久丢失(噪声全丢), 超过此时长彻底退出掉台模式,
+# 防整局卡在drop。默认90s(比赛120s内), 正常回台<10s远不触及; 仅防S永久丢失的极端情况。
+# 注: 硬超时前视觉持续按黑检测G/X迟滞辅助回台, 不会切回发F/E/N(避免误确认陷阱)。
+DROP_RECOVERY_HARD_TIMEOUT = float(os.environ.get('VISION_DROP_HARD_TIMEOUT', '90.0'))
+# 稳定退出(C2-F1修复, 烛对抗复核要求): drop模式下黑色ratio持续低于LOW达此时长, 视为机器人
+# 已稳定回到台面中央, 自主退出掉台模式(不死等STM32的'S')。覆盖"S被噪声吞但已实际上台"场景,
+# 避免最长90s只发G/X的瞎眼。默认10s: 正常回台<10s, Backup过程(SPIN/RUSH)会周期扫到边缘
+# ratio高, 不会连续低10s误退; 机器人真卡边缘时ratio时高时低也不会误退(持续辅助到硬超时)。
+DROP_STABLE_EXIT_S = float(os.environ.get('VISION_DROP_STABLE_EXIT', '10.0'))
 DROP_RATIO_EMA = float(os.environ.get('VISION_DROP_RATIO_EMA', '0.35'))  # ratio EMA (稍降→更平滑)
 DROP_DIR_EMA = float(os.environ.get('VISION_DROP_DIR_EMA', '0.25'))      # direction EMA (稍降→更平滑)
 
 # ============ 回声确认 (STM32回传) ============
-ECHO_ENABLED = os.environ.get('VISION_ECHO', '1') != '0'         # 启用回声解析
+# 默认关闭 (2026-05-29): STM32 vision_parser.c 从未实现 $type*CS 回声帧回传,
+# 且 comm.read_commands() 只解析 #<cmd> 命令、不解析 $ 帧 → echo 链路本就不通。
+# 强行开启会让 echo_healthy 在 echo_count==0 时恒返回 True (假阳性健康信号),
+# MJPEG 画面显示假的 "STM32 waiting"/"ok"。关闭后画面诚实显示 "ECHO OFF"。
+# 如未来 STM32 实现 $ 帧回传 + comm 补回声解析, 再设 VISION_ECHO=1 启用。
+ECHO_ENABLED = os.environ.get('VISION_ECHO', '0') != '0'         # 默认关闭(STM32未实现回传)
 ECHO_TIMEOUT = float(os.environ.get('VISION_ECHO_TIMEOUT', '1.0'))  # 回声超时(秒), 超时视为通信异常
 
 # ============ 协议 v2 (向后兼容) ============
