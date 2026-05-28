@@ -25,7 +25,9 @@ typedef struct {
     uint32_t last_update_ms;
     uint32_t rx_bytes;
     uint32_t frame_count;
+    uint32_t angle_count;
     uint32_t checksum_error_count;
+    uint32_t restart_fail_count;
     uint8_t last_frame_type;
     uint8_t online;
 } JY62_Data_t;
@@ -35,7 +37,10 @@ extern volatile JY62_Data_t jy62_data;
 void JY62_Init(void);
 void JY62_Update(void);
 void JY62_UART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
+void JY62_RestartRx(void);
 uint8_t JY62_IsOnline(void);
 uint8_t JY62_IsStable(float max_roll_deg, float max_pitch_deg);
+void JY62_PitchTilt_Reset(void);
+uint8_t JY62_PitchTiltDetected(float threshold_deg, uint32_t confirm_ms);
 
 #endif

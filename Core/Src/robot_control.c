@@ -4,18 +4,31 @@
 #include "robot_fight.h"
 #include "robot_backup.h"
 #include "motor.h"
+#include "vision_parser.h"
+
+#define ROBOT_ATTACK_DIR_CONFIRM_COUNT 2U
 
 static RobotState robot_state;
+static EnemyDir robot_attack_candidate_dir = DIR_NONE;
+static uint8_t robot_attack_candidate_count = 0;
+
+static void Robot_Control_ResetAttackConfirm(void)
+{
+    robot_attack_candidate_dir = DIR_NONE;
+    robot_attack_candidate_count = 0;
+}
 
 static void Robot_Control_EnterRoaming(void)
 {
     Roaming_Init();
+    Robot_Control_ResetAttackConfirm();
     robot_state = ROBOT_ROAMING;
 }
 
 static void Robot_Control_EnterBackup(void)
 {
     MOTOR_BrakeAll();
+    Vision_SendCmd('D');
     Backup_Init();
     robot_state = ROBOT_BACKUP;
 }
@@ -23,6 +36,7 @@ static void Robot_Control_EnterBackup(void)
 void Robot_Control_Init(void)
 {
     GoUp_Init();
+    Robot_Control_ResetAttackConfirm();
     robot_state = ROBOT_GO_UP;
 }
 
@@ -53,9 +67,25 @@ void Robot_Control_Update(void)
                 break;
             }
             enemy_dir = Fight_GetEnemyDir();
-            if (enemy_dir != DIR_NONE)
+            if (enemy_dir == DIR_NONE)
+            {
+                Robot_Control_ResetAttackConfirm();
+                break;
+            }
+            if (enemy_dir != robot_attack_candidate_dir)
+            {
+                robot_attack_candidate_dir = enemy_dir;
+                robot_attack_candidate_count = 1;
+                break;
+            }
+            if (robot_attack_candidate_count < ROBOT_ATTACK_DIR_CONFIRM_COUNT)
+            {
+                robot_attack_candidate_count++;
+            }
+            if (robot_attack_candidate_count >= ROBOT_ATTACK_DIR_CONFIRM_COUNT)
             {
                 Fight_InitWithDir(enemy_dir);
+                Robot_Control_ResetAttackConfirm();
                 robot_state = ROBOT_ATTACK;
             }
             break;
@@ -78,6 +108,7 @@ void Robot_Control_Update(void)
             Backup_Update();
             if (Backup_IsDone())
             {
+                Vision_SendCmd('S');
                 robot_state = ROBOT_ROAMING;
             }
             break;

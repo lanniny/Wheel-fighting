@@ -72,8 +72,11 @@ TeamColor Startup_WaitForTrigger(void)
  */
 void Startup_Notify(TeamColor team)
 {
-    uint8_t msg = (team == TEAM_YELLOW) ? 'y' : 'b';
-    HAL_UART_Transmit(&huart2, &msg, 1, 100);
+    /* 命令定界 (2026-05-28): #<color>\n, 与 Vision_SendColor 一致, 上位机只认定界命令 */
+    uint8_t buf[3] = { (uint8_t)'#',
+                       (team == TEAM_YELLOW) ? (uint8_t)'y' : (uint8_t)'b',
+                       (uint8_t)'\n' };
+    HAL_UART_Transmit(&huart2, buf, 3, 100);
 }
 
 /**
@@ -120,16 +123,15 @@ void GoUp_Update()
 
             if(elapsed_time >= GOUP_RUSH_TIME)
             {
-                GoUp_Stage = GOUP_CONFIRM;
+                GoUp_Stage = GOUP_TURN;
                 GoUp_StartTime = current_time;
-                GoUp_ShadeCount = 0;
             }
             break;
 
         case GOUP_CONFIRM:
             MOTOR_StopAll();
             site_detect_shade();
-            if(voltage_v0 < 2.8f && voltage_v1 < 2.8f)
+            if(voltage_v0 < 2.8f)
             {
                 if(GoUp_ShadeCount < GOUP_SHADE_CONFIRM_COUNT)
                 {

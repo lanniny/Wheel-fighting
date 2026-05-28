@@ -76,3 +76,30 @@ __pycache__/
 
 # Spec workflow 工具
 .spec-workflow/
+
+# 大目录 (体积过大, 禁止上传 GitHub)
+tools/
+external/
+robot-fighting/
+outputs/
+材料/
+视频/
+
+# 时间戳备份目录
+*_bak_*/
+Core_bak_*/
+
+# 调试/标定图片 (全局)
+*.jpg
+*.jpeg
+
+# 申报/作品 PDF
+*.pdf
+
+# 多AI协作体系本地产物 (不入库)
+.ai-shared/
+.trellis/
+.vibeskills/
+.playwright-mcp/
+AGENTS.md
+GEMINI.md

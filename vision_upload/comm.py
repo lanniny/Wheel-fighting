@@ -327,37 +327,30 @@ class UartComm:
         if len(self._rx_buf) > 1024:
             self._rx_buf = self._rx_buf[-512:]
 
-        new_buf = b''
+        # 命令定界协议 (2026-05-28): STM32 命令一律 #<cmd>\n 格式。
+        # 只认此格式; 帧外一切散字节(STM32 debug 串 state:.../线路噪声)全部丢弃,
+        # 根治 debug 串中 's'(→active)/'c'(→collect) 被误解析为命令的污染 bug。
         buf = self._rx_buf
         pos = 0
-
-        while pos < len(buf):
-            dollar = buf.find(b'$', pos)
-
-            if dollar < 0:
-                for i in range(pos, len(buf)):
-                    c = self._parse_cmd_byte(chr(buf[i]))
-                    if c:
-                        commands.append(c)
+        while True:
+            hash_idx = buf.find(b'#', pos)
+            if hash_idx < 0:
+                # 无更多命令起始符: 丢弃全部已扫描数据
+                pos = len(buf)
                 break
-
-            for i in range(pos, dollar):
+            newline = buf.find(b'\n', hash_idx)
+            if newline < 0:
+                # '#' 已到但命令未收全: 保留从 '#' 起, 等下一轮补齐
+                pos = hash_idx
+                break
+            # 完整命令帧 #<body>\n: 逐字符提取有效命令
+            for i in range(hash_idx + 1, newline):
                 c = self._parse_cmd_byte(chr(buf[i]))
                 if c:
                     commands.append(c)
-
-            newline = buf.find(b'\n', dollar)
-            if newline < 0:
-                new_buf = buf[dollar:]
-                break
-
-            frame = buf[dollar:newline + 1]
-            if self._echo_enabled:
-                self._parse_echo_frame(frame)
-
             pos = newline + 1
 
-        self._rx_buf = new_buf
+        self._rx_buf = buf[pos:]
         return commands
 
     # ------------------------------------------------------------------
@@ -455,19 +448,10 @@ class UartComm:
 
         self._tx_total += 1
         try:
-            dir_int = max(-100, min(100, round(direction * 100)))
-            if target_type == 'X':
-                body = 'X,0,0,0,0'
-            else:
-                body = f'{target_type},{cx},{cy},{int(area)},{dir_int:+d}'
-
-            # 协议 v2: 追加 ts,conf,tid (向后兼容, v1 STM32 自动忽略)
-            if getattr(config, 'PROTOCOL_V2', False):
-                ts_ms = int((now * 1000) % 65536)
-                conf = 50 if confidence is None else max(0, min(100, int(confidence)))
-                tid = 0 if target_id is None else int(target_id)
-                body = f'{body},{ts_ms},{conf},{tid}'
-
+            # 协议简化 (2026-05-28): STM32 实战只消费 type 字段,
+            # cx/cy/area/dir 在下位机已无消费者 → 帧体只发 type ($<type>*CS\n)。
+            # cx/cy/area/direction 入参保留, 仅供本层自适应发送频率使用, 不再编码进帧。
+            body = target_type
             cs = self._checksum(body)
             msg = f'${body}*{cs}\n'
             self.ser.write(msg.encode())

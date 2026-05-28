@@ -10,6 +10,7 @@
 #include "shade.h"
 #include "obstacle.h"
 #include "motor.h"
+#include "jy62.h"
 
 
 typedef enum {
@@ -35,6 +36,15 @@ static int detect_rear_edge(void)
     return (Obs_Data.IR12 != OBS_BLOCKED_STATE && Obs_Data.IR13 != OBS_BLOCKED_STATE);
 }
 
+static void Roaming_StartPitchRecover(uint32_t now)
+{
+    Roaming_ShadeCount = 0;
+    Roaming_RearEdgeCount = 0;
+    MOTOR_BrakeAllRelease();
+    Roaming_Stage = ROAMING_PITCH_RECOVER;
+    Roaming_StartTime = now;
+}
+
 static RoamingBackReason get_front_edge_reason(void)
 {
     if(Obs_Data.IR1 == OBS_EDGE_TRIGGERED_STATE && Obs_Data.IR2 == OBS_EDGE_TRIGGERED_STATE)
@@ -53,7 +63,7 @@ static RoamingBackReason get_front_edge_reason(void)
 }
 
 /**
- * @description: 检测是否掉落擂台（V0/V1 两路同时超阈值判定掉台）
+ * @description: 检测是否掉落擂台（V0 超阈值判定掉台）
  * @param void
  * @return int 1=掉落擂台, 0=在擂台上
  */
@@ -61,8 +71,7 @@ static int detect_shade(void)
 {
     site_detect_shade();//read shade sensor data
 
-    if((voltage_v0 > 2.8f && voltage_v0 < 3.0f) &&
-       (voltage_v1 > 2.8f && voltage_v1 < 3.0f))
+    if(voltage_v0 > 2.8f && voltage_v0 < 3.1f)
     {
         if(Roaming_ShadeCount < ROAMING_SHADE_CONFIRM_COUNT)
         {
@@ -95,6 +104,7 @@ void Roaming_Init(void)
     Roaming_LastSingleBackReason = BACK_REASON_NONE;
     Roaming_SameSideRepeatCount = 0;
     Roaming_RearEdgeCount = 0;
+    JY62_PitchTilt_Reset();
 }
 
 /**
@@ -146,6 +156,15 @@ void Roaming_Update(void)
         {
             Roaming_RearEdgeCount = 0;
         }
+    }
+
+    if(Roaming_Stage == ROAMING_FORWARD &&
+       current_reason == BACK_REASON_NONE &&
+       !detect_rear_edge() &&
+       JY62_PitchTiltDetected(ROAMING_PITCH_TILT_THRESHOLD_DEG, ROAMING_PITCH_TILT_CONFIRM_MS))
+    {
+        Roaming_StartPitchRecover(current_time);
+        return;
     }
 
     switch(Roaming_Stage)
@@ -339,6 +358,20 @@ void Roaming_Update(void)
         case ROAMING_REAR_ESCAPE:
             drive_user_defined(ROAMING_REAR_ESCAPE_SPEED, ROAMING_REAR_ESCAPE_SPEED);
             if(elapsed_time >= ROAMING_REAR_ESCAPE_TIME)
+            {
+                Roaming_Stage = ROAMING_FORWARD;
+                Roaming_StartTime = current_time;
+            }
+            break;
+
+        case ROAMING_PITCH_RECOVER:
+            if(MOTOR_IsBraking())
+            {
+                Roaming_StartTime = current_time;
+                break;
+            }
+            drive_user_defined(-ROAMING_PITCH_RECOVER_SPEED, -ROAMING_PITCH_RECOVER_SPEED);
+            if(elapsed_time >= ROAMING_PITCH_RECOVER_TIME)
             {
                 Roaming_Stage = ROAMING_FORWARD;
                 Roaming_StartTime = current_time;

@@ -168,8 +168,8 @@ YELLOW_H_STD_MAX = int(os.environ.get('VISION_YELLOW_H_STD', '25'))           # 
 FRAME_BOTTOM_EXCLUDE = float(os.environ.get('VISION_BOTTOM_EXCL', '0.12'))    # 忽略画面底部12%
 
 # ============ 友方近距离报警 (双色模式防误发F) ============
-FRIEND_ALERT_AREA = _safe_int('VISION_FRIEND_ALERT', 800)
-FRIEND_ALERT_AREA_YELLOW = _safe_int('VISION_FRIEND_ALERT_Y', 3000)  # 黄色队友方门槛更高 (地板暖色调防误检)
+FRIEND_ALERT_AREA = _safe_int('VISION_FRIEND_ALERT', 6000)         # 800→6000: 只有贴近大友方块才避让, 远处小误检不发F (修乱退)
+FRIEND_ALERT_AREA_YELLOW = _safe_int('VISION_FRIEND_ALERT_Y', 6000)  # 3000→6000: 黄队同步上调 (地板暖色调误检更严重)
 
 # ============ 串口通信 (支持环境变量覆盖) ============
 def _find_uart():
@@ -255,7 +255,7 @@ UART_TARGET_INTERVAL = float(os.environ.get('VISION_TARGET_INTERVAL', '0.050'))
 UART_FAST_INTERVAL = float(os.environ.get('VISION_FAST_INTERVAL', '0.033'))
 
 # ============ 目标丢失保持 (Holdover) ============
-LOST_TARGET_HOLDOVER_FRAMES = int(os.environ.get('VISION_HOLDOVER_FRAMES', '3'))
+LOST_TARGET_HOLDOVER_FRAMES = int(os.environ.get('VISION_HOLDOVER_FRAMES', '1'))  # 3→1: F类型不把单次假阳放大成3帧后退 (修乱退)
 LOST_TARGET_AREA_DECAY = float(os.environ.get('VISION_HOLDOVER_AREA_DECAY', '0.7'))
 
 # ============ 智能优先级评分 ============

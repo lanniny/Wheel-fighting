@@ -51,8 +51,14 @@ uint8_t Vision_IsTimeout(void);
 void Vision_GetStats(uint32_t *total, uint32_t *success, uint32_t *cserr);
 
 /**
- * @brief 获取DMA重启失败计数 (正常应为0, 非0说明IDLE回调重启有问题)
+ * @brief 获取DMA重启失败计数 (赛前现场观察; 正常0, 非0=ORE/拆包高发)
  */
 uint32_t Vision_GetRestartFails(void);
+
+/**
+ * @brief 原子读取视觉目标快照 (关中断拷贝, 防中断写/主循环读撕裂)
+ * @param out 输出快照缓冲; NULL 忽略
+ */
+void Vision_GetSnapshot(VisionTarget_t *out);
 
 #endif /* __VISION_PARSER_H */

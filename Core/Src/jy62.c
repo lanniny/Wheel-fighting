@@ -18,6 +18,9 @@ volatile JY62_Data_t jy62_data = {0};
 static uint8_t jy62_rx_dma_buf[JY62_UART_RX_BUF_SIZE];
 static uint8_t jy62_frame_buf[JY62_FRAME_SIZE];
 static uint8_t jy62_frame_index = 0u;
+static uint32_t jy62_pitch_tilt_last_angle_count = 0u;
+static uint32_t jy62_pitch_tilt_start_ms = 0u;
+static uint8_t jy62_pitch_tilt_active = 0u;
 
 static int16_t jy62_unpack_i16(const uint8_t *low_byte)
 {
@@ -72,6 +75,7 @@ static void jy62_parse_frame(const uint8_t *frame)
         jy62_data.roll_deg = (float)jy62_data.roll_raw * JY62_ANGLE_SCALE_DEG;
         jy62_data.pitch_deg = (float)jy62_data.pitch_raw * JY62_ANGLE_SCALE_DEG;
         jy62_data.yaw_deg = (float)jy62_data.yaw_raw * JY62_ANGLE_SCALE_DEG;
+        jy62_data.angle_count++;
     }
     else
     {
@@ -117,7 +121,10 @@ static void jy62_parse_byte(uint8_t data)
 
 static void jy62_restart_rx(void)
 {
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart3, jy62_rx_dma_buf, JY62_UART_RX_BUF_SIZE);
+    if (HAL_UARTEx_ReceiveToIdle_DMA(&huart3, jy62_rx_dma_buf, JY62_UART_RX_BUF_SIZE) != HAL_OK)
+    {
+        jy62_data.restart_fail_count++;
+    }
     __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);
 }
 
@@ -126,6 +133,9 @@ void JY62_Init(void)
     memset((void *)&jy62_data, 0, sizeof(jy62_data));
     memset(jy62_rx_dma_buf, 0, sizeof(jy62_rx_dma_buf));
     jy62_frame_index = 0u;
+    jy62_pitch_tilt_last_angle_count = 0u;
+    jy62_pitch_tilt_start_ms = 0u;
+    jy62_pitch_tilt_active = 0u;
     jy62_restart_rx();
 }
 
@@ -157,6 +167,12 @@ void JY62_UART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     jy62_restart_rx();
 }
 
+void JY62_RestartRx(void)
+{
+    /* 供 HAL_UART_ErrorCallback (vision_parser.c) 兜底 USART3 ORE 后重启 */
+    jy62_restart_rx();
+}
+
 uint8_t JY62_IsOnline(void)
 {
     if (jy62_data.online == 0u)
@@ -185,4 +201,59 @@ uint8_t JY62_IsStable(float max_roll_deg, float max_pitch_deg)
     }
 
     return 1u;
+}
+
+void JY62_PitchTilt_Reset(void)
+{
+    jy62_pitch_tilt_last_angle_count = jy62_data.angle_count;
+    jy62_pitch_tilt_start_ms = 0u;
+    jy62_pitch_tilt_active = 0u;
+}
+
+uint8_t JY62_PitchTiltDetected(float threshold_deg, uint32_t confirm_ms)
+{
+    uint32_t now;
+    uint32_t angle_count;
+    float pitch;
+
+    if (!JY62_IsOnline())
+    {
+        jy62_pitch_tilt_active = 0u;
+        return 0u;
+    }
+
+    angle_count = jy62_data.angle_count;
+    if (angle_count == jy62_pitch_tilt_last_angle_count)
+    {
+        return 0u;
+    }
+    jy62_pitch_tilt_last_angle_count = angle_count;
+
+    pitch = jy62_data.pitch_deg;
+    if (pitch < 0.0f)
+    {
+        pitch = -pitch;
+    }
+
+    if (pitch < threshold_deg)
+    {
+        jy62_pitch_tilt_active = 0u;
+        return 0u;
+    }
+
+    now = HAL_GetTick();
+    if (!jy62_pitch_tilt_active)
+    {
+        jy62_pitch_tilt_active = 1u;
+        jy62_pitch_tilt_start_ms = now;
+        return 0u;
+    }
+
+    if ((now - jy62_pitch_tilt_start_ms) >= confirm_ms)
+    {
+        jy62_pitch_tilt_start_ms = now;
+        return 1u;
+    }
+
+    return 0u;
 }

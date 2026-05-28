@@ -87,7 +87,7 @@ static void Backup_StartTurn180(uint32_t current_time)
 
 static int Backup_IsOnStage(void)
 {
-    return (voltage_v0 < 2.8f && voltage_v1 < 2.8f);
+    return (voltage_v0 < 2.8f);
 }
 
 static int Backup_IsFrontBoundaryBlocked(void)
@@ -97,13 +97,16 @@ static int Backup_IsFrontBoundaryBlocked(void)
 
 static char Backup_GetVisionType(void)
 {
-    if(Vision_IsTimeout() || !vision_target.valid)
+    VisionTarget_t snap;
+    Vision_GetSnapshot(&snap);
+
+    if(Vision_IsTimeout() || !snap.valid)
     {
         Backup_StableVisionType = 'X';
         return 'X';
     }
 
-    Backup_StableVisionType = vision_target.type;
+    Backup_StableVisionType = snap.type;
     return Backup_StableVisionType;
 }
 

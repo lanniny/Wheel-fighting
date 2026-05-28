@@ -59,8 +59,7 @@
 #define JY62_TEST_MODE         0
 #define PID_DEBUG_MODE         0
 #define UART_TEST_MODE         0
-#define STATE_UART_DEBUG_MODE  0
-
+#define STATE_UART_DEBUG_MODE  1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -106,22 +105,63 @@ static const char *State_Debug_GetName(RobotState state)
   }
 }
 
+static uint8_t State_Debug_PinValue(GPIO_PinState state)
+{
+  return (state == GPIO_PIN_SET) ? 1U : 0U;
+}
+
 static void State_Debug_Update(void)
 {
   static uint32_t state_debug_last_print = 0;
+  static char uart_buf[128];
   uint32_t now = HAL_GetTick();
 
   if ((now - state_debug_last_print) >= STATE_UART_DEBUG_PRINT_MS)
   {
     RobotState state = Robot_Control_GetState();
-    char uart_buf[32] = {0};
+    uint32_t vision_rx_total;
+    uint32_t vision_rx_success;
+    uint32_t vision_rx_cserr;
+    uint8_t vision_timeout = Vision_IsTimeout();
     int len;
 
     state_debug_last_print = now;
-    len = snprintf(uart_buf, sizeof(uart_buf), "state:%s,%d\r\n", State_Debug_GetName(state), (int)state);
-    if (len > 0)
+    if (huart2.gState != HAL_UART_STATE_READY)
     {
-      HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, (uint16_t)len, 100);
+      return;
+    }
+
+    Vision_GetStats(&vision_rx_total, &vision_rx_success, &vision_rx_cserr);
+    len = snprintf(uart_buf, sizeof(uart_buf),
+                   "state:%s,vis:%c,v:%u,to:%u,rx:%lu,ok:%lu,cs:%lu,rf:%lu,jrf:%lu,ir:%u%u%u%u%u%u%u%u%u%u%u%u%u\r\n",
+                   State_Debug_GetName(state),
+                   vision_target.type,
+                   vision_target.valid,
+                   vision_timeout,
+                   (unsigned long)vision_rx_total,
+                   (unsigned long)vision_rx_success,
+                   (unsigned long)vision_rx_cserr,
+                   (unsigned long)Vision_GetRestartFails(),
+                   (unsigned long)jy62_data.restart_fail_count,
+                   State_Debug_PinValue(Obs_Data.IR1),
+                   State_Debug_PinValue(Obs_Data.IR2),
+                   State_Debug_PinValue(Obs_Data.IR3),
+                   State_Debug_PinValue(Obs_Data.IR4),
+                   State_Debug_PinValue(Obs_Data.IR5),
+                   State_Debug_PinValue(Obs_Data.IR6),
+                   State_Debug_PinValue(Obs_Data.IR7),
+                   State_Debug_PinValue(Obs_Data.IR8),
+                   State_Debug_PinValue(Obs_Data.IR9),
+                   State_Debug_PinValue(Obs_Data.IR10),
+                   State_Debug_PinValue(Obs_Data.IR11),
+                   State_Debug_PinValue(Obs_Data.IR12),
+                   State_Debug_PinValue(Obs_Data.IR13));
+    if ((len > 0) && (len < (int)sizeof(uart_buf)))
+    {
+      /* 阻塞发送(原 DMA): 与 Vision_SendCmd 阻塞 TX 统一通道, 消除抢 gState
+       * 丢指令(F3)。500ms 一次, ~120B@115200 阻塞约 10ms, 对 5ms 控制周期可接受。
+       * 上位机已改为只认 #<cmd>\n 定界命令, 此 debug 串不会再被误解析为命令。 */
+      HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, (uint16_t)len, 20);
     }
   }
 }
@@ -308,7 +348,6 @@ int main(void)
   MOTOR_StopAll();
   Startup_WaitForTrigger();
   Vision_Init();
-  JY62_Init();
   Vision_SendCmd('N');
   Robot_Control_Init();
 #elif SHADE_OLED_TEST_MODE
@@ -361,7 +400,6 @@ int main(void)
   MOTOR_StopAll();
 #elif UART_TEST_MODE
   (void)control_last_tick;
-  HAL_UART_Transmit(&huart2, (uint8_t *)"USART2 TEST START\r\n", 19, 100);
 #else
   MOTOR_Init();
   ENCODER_Init();
@@ -372,7 +410,6 @@ int main(void)
   MOTOR_StopAll();
   Startup_WaitForTrigger();
   Vision_Init();
-  JY62_Init();
   Vision_SendCmd('N');
   Robot_Control_Init();
 #endif
@@ -497,8 +534,13 @@ int main(void)
     PID_Debug_Update();
     HAL_Delay(1);
 #elif UART_TEST_MODE
-    HAL_UART_Transmit(&huart2, (uint8_t *)"USART2 OK\r\n", 11, 100);
-    HAL_Delay(2000);
+    {
+      uint8_t rx_ch;
+      if (HAL_UART_Receive(&huart2, &rx_ch, 1U, 100U) == HAL_OK)
+      {
+        HAL_UART_Transmit(&huart2, &rx_ch, 1U, 100U);
+      }
+    }
 #else
     Edge_Sensor_Detect();
     JY62_Update();

@@ -412,8 +412,8 @@ class ColorDetector:
 
         for color_name, hsv_range in colors:
             lower = hsv_range['lower'].copy()
-            if color_name != 'yellow':
-                lower[1] = max(0, lower[1] - 30)
+            # 蓝色不再放宽 S 下限(原 -30): 偏青绿背景低饱和区会被误检为蓝→友方乱退元凶,
+            # 真贴脸蓝块饱和度足够, 用原始 S 下限不影响避让
             mask = cv2.inRange(roi, lower, hsv_range['upper'])
             ratio = cv2.countNonZero(mask) / roi_pixels
             if ratio > self._close_range_ratio:
