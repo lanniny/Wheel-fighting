@@ -59,6 +59,7 @@
 #define JY62_TEST_MODE         0
 #define PID_DEBUG_MODE         0
 #define UART_TEST_MODE         0
+#define STATE_UART_DEBUG_MODE  0
 
 /* USER CODE END PD */
 
@@ -88,6 +89,42 @@ void SystemClock_Config(void);
 
 #if BACKUP_TEST_MODE
 static char Backup_Test_LastNonXType = 'X';
+#endif
+
+#if STATE_UART_DEBUG_MODE
+#define STATE_UART_DEBUG_PRINT_MS 500U
+
+static const char *State_Debug_GetName(RobotState state)
+{
+  switch (state)
+  {
+    case ROBOT_GO_UP:   return "GO_UP";
+    case ROBOT_ROAMING: return "ROAMING";
+    case ROBOT_ATTACK:  return "ATTACK";
+    case ROBOT_BACKUP:  return "BACKUP";
+    default:            return "UNKNOWN";
+  }
+}
+
+static void State_Debug_Update(void)
+{
+  static uint32_t state_debug_last_print = 0;
+  uint32_t now = HAL_GetTick();
+
+  if ((now - state_debug_last_print) >= STATE_UART_DEBUG_PRINT_MS)
+  {
+    RobotState state = Robot_Control_GetState();
+    char uart_buf[32] = {0};
+    int len;
+
+    state_debug_last_print = now;
+    len = snprintf(uart_buf, sizeof(uart_buf), "state:%s,%d\r\n", State_Debug_GetName(state), (int)state);
+    if (len > 0)
+    {
+      HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, (uint16_t)len, 100);
+    }
+  }
+}
 #endif
 
 #if JY62_TEST_MODE
@@ -261,7 +298,20 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   
-#if SHADE_OLED_TEST_MODE
+#if STATE_UART_DEBUG_MODE
+  MOTOR_Init();
+  ENCODER_Init();
+  ENCODER_ResetAll();
+  Motor_PID_Init();
+  JY62_Init();
+  Backup_Init();
+  MOTOR_StopAll();
+  Startup_WaitForTrigger();
+  Vision_Init();
+  JY62_Init();
+  Vision_SendCmd('N');
+  Robot_Control_Init();
+#elif SHADE_OLED_TEST_MODE
   OLED_Init();
   OLED_Clear();
   Shade_Sensor_Init();
@@ -334,7 +384,18 @@ int main(void)
   while (1)
   {
     MOTOR_Service();
-#if SHADE_OLED_TEST_MODE
+#if STATE_UART_DEBUG_MODE
+    Edge_Sensor_Detect();
+    JY62_Update();
+    uint32_t now = HAL_GetTick();
+    if ((now - control_last_tick) >= 5U)
+    {
+      control_last_tick = now;
+      Robot_Control_Update();
+      Motor_PID_Service();
+    }
+    State_Debug_Update();
+#elif SHADE_OLED_TEST_MODE
     site_detect_shade();
 
     uint32_t adc0 = shade_v0;

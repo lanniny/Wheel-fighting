@@ -7,9 +7,15 @@
  *   CS:   body字段的异或校验和(十六进制, 2位)
  *   示例: $E,320,240,5000,+25*4A\n
  *
- * 实现方案: USART2 + DMA循环接收 + IDLE行中断
+ * 实现方案: USART2 + DMA(NORMAL模式) + IDLE行中断
  *   - HAL_UARTEx_ReceiveToIdle_DMA 自动利用IDLE中断触发回调
- *   - 每帧回调后立即重启DMA, 保证连续接收
+ *   - Vision_Init 运行时强制DMA为NORMAL模式 (CubeMX默认生成CIRCULAR,
+ *     而CIRCULAR下IDLE回调后RxState不回READY, 回调内重启返回HAL_BUSY,
+ *     导致DMA不再重挂载、仅解析首帧; NORMAL模式下Size=本帧长度, 从buf[0]
+ *     解析正确, 回调重启成功)
+ *   - 每帧IDLE回调后重启DMA, 保证连续接收
+ *   - TODO(长期): 应直接在 robot.ioc/CubeMX 把 USART2_RX DMA 改为 Normal,
+ *     避免运行时修补与 usart.c 生成码不一致
  */
 #include "vision_parser.h"
 #include "usart.h"
@@ -29,6 +35,7 @@ volatile VisionTarget_t vision_target = { .type = 'X', .valid = 0u };
 static uint32_t         vision_rx_total   = 0u;  /* DMA回调触发次数 */
 static uint32_t         vision_rx_success = 0u;  /* 成功解析帧数 */
 static uint32_t         vision_rx_cserr   = 0u;  /* 校验和错误次数 */
+static uint32_t         vision_rx_restart_fail = 0u; /* DMA重启失败次数 */
 
 /* ---- 内部缓冲区 ---- */
 static uint8_t dma_rx_buf[DMA_RX_BUF_SIZE];
@@ -153,8 +160,13 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             parse_buffer(dma_rx_buf, Size);
         }
 
-        /* 立即重启DMA接收, 准备下一帧 */
-        HAL_UARTEx_ReceiveToIdle_DMA(&huart2, dma_rx_buf, DMA_RX_BUF_SIZE);
+        /* 重启DMA接收: NORMAL模式下IDLE触发后HAL已自动Abort并把RxState置READY,
+         * 此处直接重启即可成功; 切勿在ISR里调阻塞的HAL_UART_AbortReceive()
+         * (它轮询HAL_GetTick, 而SysTick优先级低于USART2, 会导致tick不前进死锁) */
+        if (HAL_UARTEx_ReceiveToIdle_DMA(&huart2, dma_rx_buf, DMA_RX_BUF_SIZE) != HAL_OK)
+        {
+            vision_rx_restart_fail++;
+        }
 
         /* 禁用半传输中断, 防止在缓冲区半满时误触发回调 */
         __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
@@ -180,6 +192,10 @@ void Vision_Init(void)
     memset((void *)&vision_target, 0, sizeof(vision_target));
     vision_target.type  = 'X';
     vision_target.valid = 0u;
+
+    /* 强制DMA为NORMAL模式, 避免CIRCULAR模式下RxState卡BUSY导致IDLE回调只触发一次 */
+    huart2.hdmarx->Init.Mode = DMA_NORMAL;
+    HAL_DMA_Init(huart2.hdmarx);
 
     HAL_UARTEx_ReceiveToIdle_DMA(&huart2, dma_rx_buf, DMA_RX_BUF_SIZE);
     __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
@@ -223,4 +239,12 @@ void Vision_GetStats(uint32_t *total, uint32_t *success, uint32_t *cserr)
     if (total)   *total   = vision_rx_total;
     if (success) *success = vision_rx_success;
     if (cserr)   *cserr   = vision_rx_cserr;
+}
+
+/**
+ * @brief 获取DMA重启失败计数 (供调试, 正常应为0)
+ */
+uint32_t Vision_GetRestartFails(void)
+{
+    return vision_rx_restart_fail;
 }

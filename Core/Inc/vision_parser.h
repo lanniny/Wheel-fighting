@@ -50,4 +50,9 @@ uint8_t Vision_IsTimeout(void);
  */
 void Vision_GetStats(uint32_t *total, uint32_t *success, uint32_t *cserr);
 
+/**
+ * @brief 获取DMA重启失败计数 (正常应为0, 非0说明IDLE回调重启有问题)
+ */
+uint32_t Vision_GetRestartFails(void);
+
 #endif /* __VISION_PARSER_H */

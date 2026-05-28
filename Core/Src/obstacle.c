@@ -25,8 +25,8 @@ void Obs_Sensor_ReadAll(void)
 {
   // 读取 GPIOE 上的 IR_1 到 IR_8，GPIOA 上的 IR_9、IR_10，以及 GPIOC 上的 IR11、IR12、IR13，11是右铲处，12是右后边缘，13是左后边缘
 
-    Obs_Data.IR1 = HAL_GPIO_ReadPin(IR_1_GPIO_Port, IR_1_Pin);
-    Obs_Data.IR2 = invert_state(HAL_GPIO_ReadPin(IR_2_GPIO_Port, IR_2_Pin));
+    Obs_Data.IR1 = invert_state(HAL_GPIO_ReadPin(IR_1_GPIO_Port, IR_1_Pin));
+    Obs_Data.IR2 = (HAL_GPIO_ReadPin(IR_2_GPIO_Port, IR_2_Pin));
     Obs_Data.IR3 = HAL_GPIO_ReadPin(IR_3_GPIO_Port, IR_3_Pin);
     Obs_Data.IR4 = HAL_GPIO_ReadPin(IR_4_GPIO_Port, IR_4_Pin);
     Obs_Data.IR5 = HAL_GPIO_ReadPin(IR_5_GPIO_Port, IR_5_Pin);
@@ -45,8 +45,8 @@ void Obs_Sensor_ReadAll(void)
   */
 void Edge_Sensor_Detect(void)
 {
-    Obs_Data.IR1 = HAL_GPIO_ReadPin(IR_1_GPIO_Port, IR_1_Pin);
-    Obs_Data.IR2 = invert_state(HAL_GPIO_ReadPin(IR_2_GPIO_Port, IR_2_Pin));
+    Obs_Data.IR1 = invert_state(HAL_GPIO_ReadPin(IR_1_GPIO_Port, IR_1_Pin));
+    Obs_Data.IR2 = (HAL_GPIO_ReadPin(IR_2_GPIO_Port, IR_2_Pin));
     Obs_Data.IR12 = invert_state(HAL_GPIO_ReadPin(IR12_GPIO_Port, IR12_Pin));
     Obs_Data.IR13 = HAL_GPIO_ReadPin(IR13_GPIO_Port, IR13_Pin);
 }

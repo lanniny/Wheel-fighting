@@ -21,6 +21,10 @@ static uint8_t Fight_RearEdgeCount = 0;              // 后方安全传感器连
 static char Fight_PrevVisionType = 'X';              // 上一拍视觉类型（用于视觉类型消抖）
 static char Fight_StableVisionType = 'X';            // 消抖后的稳定视觉类型
 static uint8_t Fight_VisionTypeCount = 0;            // 视觉类型连续命中计数
+static uint32_t Fight_LastVisionTypeTime = 0;        // 上一次参与类型消抖的视觉帧时间戳
+static uint32_t Fight_FBAvoidVisionTime = 0;         // 上一次参与F/B回避确认的视觉帧时间戳
+static uint8_t Fight_FriendAvoidCount = 0;           // 友方回避连续确认计数
+static uint8_t Fight_BombAvoidCount = 0;             // 炸弹回避连续确认计数
 static uint32_t Fight_ShadeStartTime = 0;            // 灰度掉台原始条件开始成立的时间
 static bool Fight_DownFlag = false;                  // 掉台标志（通知总控切 BACKUP）
 static EnemyDir Fight_TrackDir = DIR_NONE;           // 侧边/后侧边甩头追踪时锁定的方向
@@ -250,8 +254,15 @@ static char Fight_GetStableVisionType(void)
         Fight_PrevVisionType = 'X';
         Fight_StableVisionType = 'X';
         Fight_VisionTypeCount = 0;
+        Fight_LastVisionTypeTime = 0;
         return 'X';
     }
+
+    if(vision_target.timestamp == Fight_LastVisionTypeTime)
+    {
+        return Fight_StableVisionType;
+    }
+    Fight_LastVisionTypeTime = vision_target.timestamp;
 
     if (vision_target.type != Fight_PrevVisionType)
     {
@@ -272,6 +283,74 @@ static char Fight_GetStableVisionType(void)
     return Fight_StableVisionType;
 }
 
+static bool Fight_IsFriendVisionFront(int8_t vision_dir)
+{
+    return (vision_dir >= -FIGHT_FRIEND_DIR_GATE && vision_dir <= FIGHT_FRIEND_DIR_GATE);
+}
+
+static void Fight_ResetFBAvoidConfirm(void)
+{
+    Fight_FriendAvoidCount = 0;
+    Fight_BombAvoidCount = 0;
+}
+
+static bool Fight_ShouldAvoidVisionTarget(char vision_type)
+{
+    uint32_t vision_time;
+    char raw_type;
+    int32_t area;
+    int8_t vision_dir;
+
+    if(Vision_IsTimeout() || !vision_target.valid)
+    {
+        Fight_ResetFBAvoidConfirm();
+        Fight_FBAvoidVisionTime = 0;
+        return false;
+    }
+
+    vision_time = vision_target.timestamp;
+    if(vision_time == Fight_FBAvoidVisionTime)
+    {
+        return false;
+    }
+    Fight_FBAvoidVisionTime = vision_time;
+
+    raw_type = vision_target.type;
+    area = vision_target.area;
+    vision_dir = vision_target.dir;
+
+    if(vision_type == 'F' && raw_type == 'F')
+    {
+        Fight_BombAvoidCount = 0;
+        if(area < FIGHT_FRIEND_AREA_OFF || !Fight_IsFriendVisionFront(vision_dir))
+        {
+            Fight_FriendAvoidCount = 0;
+        }
+        else if(area >= FIGHT_FRIEND_AREA_ON && Fight_FriendAvoidCount < FIGHT_FB_CONFIRM_COUNT)
+        {
+            Fight_FriendAvoidCount++;
+        }
+        return (Fight_FriendAvoidCount >= FIGHT_FB_CONFIRM_COUNT);
+    }
+
+    if(vision_type == 'B' && raw_type == 'B')
+    {
+        Fight_FriendAvoidCount = 0;
+        if(area < FIGHT_BOMB_AREA_OFF)
+        {
+            Fight_BombAvoidCount = 0;
+        }
+        else if(area >= FIGHT_BOMB_AREA_ON && Fight_BombAvoidCount < FIGHT_FB_CONFIRM_COUNT)
+        {
+            Fight_BombAvoidCount++;
+        }
+        return (Fight_BombAvoidCount >= FIGHT_FB_CONFIRM_COUNT);
+    }
+
+    Fight_ResetFBAvoidConfirm();
+    return false;
+}
+
 /*======状态机======*/
 
 void Fight_Init(void)
@@ -287,6 +366,9 @@ void Fight_Init(void)
     Fight_PrevVisionType = 'X';
     Fight_StableVisionType = 'X';
     Fight_VisionTypeCount = 0;
+    Fight_LastVisionTypeTime = 0;
+    Fight_FBAvoidVisionTime = 0;
+    Fight_ResetFBAvoidConfirm();
     Fight_ShadeStartTime = 0;
     Fight_DownFlag = false;
     Fight_TrackDir = DIR_NONE;
@@ -339,25 +421,15 @@ void Fight_Update(void)
 
     raw_dir = Fight_GetEnemyDir();
     front_hold_trigger = (Obs_Data.IR4 == OBS_BLOCKED_STATE && Obs_Data.IR11 == OBS_BLOCKED_STATE);
-    vision_type = Fight_GetStableVisionType();
-
-    /* P2: 视觉方向辅助IR — IR盲区时用消抖后视觉方向补充 */
-    if(raw_dir == DIR_NONE && !Vision_IsTimeout() && vision_target.valid &&
-       vision_type != 'F' && vision_type != 'B' && vision_type != 'X')
-    {
-        int8_t vdir = vision_target.dir;
-        if(vdir < FIGHT_VISION_DIR_LEFT_THRESH) raw_dir = DIR_FRONT_LEFT;
-        else if(vdir > FIGHT_VISION_DIR_RIGHT_THRESH) raw_dir = DIR_FRONT_RIGHT;
-        else raw_dir = DIR_FRONT;
-    }
-
     Fight_StableDir = raw_dir;
     Fight_PrevRawDir = raw_dir;
     dir = Fight_StableDir;
     if(dir != DIR_FRONT && Fight_State != FIGHT_FRONT_HOLD)
     {
+        // 离开正前后允许下一次双前遮挡重新进入 1000ms 正前保持。
         Fight_FrontHoldConsumed = false;
     }
+    vision_type = Fight_GetStableVisionType();
     if(Fight_State == FIGHT_ENGAGE)
     {
         Fight_UpdateLastFrontArcDir(now, dir);
@@ -398,9 +470,9 @@ void Fight_Update(void)
         }
     }
 
-    /* P1: F类型需检查area — 远距离友方(area<阈值)不触发后退, B类型无条件回避 */
-    /* 排除 TRACK_SPIN/FRONT_HOLD: 正在追敌时不应被己方块打断 */
-    if(Fight_State != FIGHT_EDGE_STOP &&
+    // F/B回避只用新视觉帧连续确认，避免单帧面积抖动导致忽远忽近。
+    if(Fight_ShouldAvoidVisionTarget(vision_type) &&
+       Fight_State != FIGHT_EDGE_STOP &&
        Fight_State != FIGHT_RETREAT &&
        Fight_State != FIGHT_TURN &&
        Fight_State != FIGHT_REAR_EDGE_STOP &&
@@ -408,18 +480,12 @@ void Fight_Update(void)
        Fight_State != FIGHT_FB_TURN &&
        Fight_State != FIGHT_FORWARD &&
        Fight_State != FIGHT_FB_ADVANCE &&
-       Fight_State != FIGHT_TRACK_SPIN &&
-       Fight_State != FIGHT_FRONT_HOLD &&
        Fight_State != FIGHT_DONE)
     {
-        if(vision_type == 'B' ||
-           (vision_type == 'F' && vision_target.area >= FIGHT_FRIEND_MIN_AREA))
-        {
-            MOTOR_BrakeAll();
-            Fight_State = FIGHT_FB_TURN;
-            Fight_StartTime = now;
-            return;
-        }
+        MOTOR_BrakeAll();
+        Fight_State = FIGHT_FB_TURN;
+        Fight_StartTime = now;
+        return;
     }
 
     if(Fight_State == FIGHT_ENGAGE && front_hold_trigger && !Fight_FrontHoldConsumed)

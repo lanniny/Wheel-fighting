@@ -4,13 +4,11 @@
 #include "robot_fight.h"
 #include "robot_backup.h"
 #include "motor.h"
-#include "vision_parser.h"
 
 static RobotState robot_state;
 
 static void Robot_Control_EnterRoaming(void)
 {
-    Vision_SendCmd('N');
     Roaming_Init();
     robot_state = ROBOT_ROAMING;
 }
@@ -18,7 +16,6 @@ static void Robot_Control_EnterRoaming(void)
 static void Robot_Control_EnterBackup(void)
 {
     MOTOR_BrakeAll();
-    Vision_SendCmd('D');
     Backup_Init();
     robot_state = ROBOT_BACKUP;
 }
@@ -61,31 +58,6 @@ void Robot_Control_Update(void)
                 Fight_InitWithDir(enemy_dir);
                 robot_state = ROBOT_ATTACK;
             }
-            /* P3: 视觉引导攻击 — IR没触发但视觉看到敌方/中立目标且足够近 */
-            else if (!Vision_IsTimeout() && vision_target.valid &&
-                     (vision_target.type == 'E' || vision_target.type == 'N') &&
-                     vision_target.area > FIGHT_VISION_ATTACK_MIN_AREA)
-            {
-                EnemyDir vdir;
-                if (vision_target.dir < FIGHT_VISION_DIR_LEFT_THRESH)
-                    vdir = DIR_FRONT_LEFT;
-                else if (vision_target.dir > FIGHT_VISION_DIR_RIGHT_THRESH)
-                    vdir = DIR_FRONT_RIGHT;
-                else
-                    vdir = DIR_FRONT;
-                Fight_InitWithDir(vdir);
-                robot_state = ROBOT_ATTACK;
-            }
-            /* P4: 友方避让 — 漫游时视觉看到友方块, 后退转向避免推自己的块 */
-            else if (!Vision_IsTimeout() && vision_target.valid &&
-                     vision_target.type == 'F' &&
-                     vision_target.area > FIGHT_FRIEND_MIN_AREA)
-            {
-                if (vision_target.dir < 0)
-                    drive_user_defined(SPEED_TURN_M, -SPEED_TURN_M);
-                else
-                    drive_user_defined(-SPEED_TURN_M, SPEED_TURN_M);
-            }
             break;
 
         case ROBOT_ATTACK:
@@ -106,7 +78,7 @@ void Robot_Control_Update(void)
             Backup_Update();
             if (Backup_IsDone())
             {
-                Robot_Control_EnterRoaming();
+                robot_state = ROBOT_ROAMING;
             }
             break;
     }

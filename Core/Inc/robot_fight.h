@@ -35,17 +35,13 @@
 #define FIGHT_TRACK_REAR_ARC_BACK_SPEED 300 //后侧方甩头内侧反转速度
 #define FIGHT_TRACK_REAR_ARC_FORWARD_SPEED 700 //后侧方甩头外侧前进速度
 #define FIGHT_VISION_CONFIRM_COUNT 2 //视觉类型消抖次数
+#define FIGHT_FRIEND_AREA_ON 5000 //友方回避进入面积阈值
+#define FIGHT_FRIEND_AREA_OFF 4200 //友方回避确认清除面积阈值
+#define FIGHT_BOMB_AREA_ON 3500 //炸弹回避进入面积阈值
+#define FIGHT_BOMB_AREA_OFF 2800 //炸弹回避确认清除面积阈值
+#define FIGHT_FB_CONFIRM_COUNT 2 //F/B回避连续新视觉帧确认次数
+#define FIGHT_FRIEND_DIR_GATE 35 //友方回避正前方向窗口
 #define FIGHT_SHADE_CONFIRM_TIME 100U //V0/V1灰度掉台持续确认时间
-
-/* P1: 视觉距离融合 — 友方面积阈值 */
-#define FIGHT_FRIEND_MIN_AREA 800  //友方最小面积 (5000→800, 配合视觉端HSV检测+Tracker 3帧确认)
-
-/* P2: 视觉方向辅助IR — 方向阈值 */
-#define FIGHT_VISION_DIR_LEFT_THRESH  (-30) //视觉方向<此值判定前左
-#define FIGHT_VISION_DIR_RIGHT_THRESH  (30) //视觉方向>此值判定前右
-
-/* P3: 视觉引导攻击 — 漫游阶段视觉触发攻击的最小面积 */
-#define FIGHT_VISION_ATTACK_MIN_AREA 3000 //视觉area>此值才从漫游进攻击
 
 /*======敌人（能量块）方向======*/
 typedef enum{
