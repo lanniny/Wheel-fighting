@@ -282,6 +282,11 @@ DISTANCE_FAR   = 3000    # 面积 < 此值 = 远距离
 
 # ============ Watchdog ============
 WATCHDOG_TIMEOUT = 5.0  # 连续无有效帧超时(s), 触发相机重启 (30→5, 比赛只有120s不能等30s)
+# 硬看门狗(2026-05-29): 主循环心跳超时阈值。相机 cap.read() 阻塞hang会让主循环僵死——
+# 主循环内的软watchdog救不了(代码执行不到)、systemd Restart=always也不触发(进程没退出)。
+# 独立看门狗线程检测主循环 N 秒无心跳即 os._exit(1), 由 systemd Restart=always 拉起重连。
+# 默认6s: 正常单帧55ms、相机重连open~2-4s都在阈值内不误杀; 真hang(无限阻塞)>6s被抓。
+CAMERA_HANG_TIMEOUT = float(os.environ.get('VISION_CAMERA_HANG_TIMEOUT', '6.0'))
 
 # ============ 检测优化 ============
 DETECT_HALF_RES = os.environ.get('VISION_HALF_RES', '1') != '0'  # 半分辨率检测
@@ -342,6 +347,12 @@ STREAM_EVERY_N_FRAMES = int(os.environ.get('VISION_STREAM_EVERY', '3'))  # 每 N
 TAG_DETECT_ENABLED = os.environ.get('VISION_TAG', '1') != '0'
 TAG_DETECT_INTERVAL = _safe_int('VISION_TAG_INTERVAL', 1)  # 全帧Tag扫描间隔 (Tag-Primary模式每帧扫描)
 TAG_PRIMARY = os.environ.get('VISION_TAG_PRIMARY', '1') != '0'  # Tag主导: HSV无Tag确认→降级为N
+# 纯Tag模式(2026-05-29): 二维码实测已足够准确, 关闭HSV己方避让保底。仅TAG_PRIMARY=1时生效。
+#   1 = 纯Tag决策 (不跑HSV detect_own, 省~15ms/帧 + 消除HSV误检干扰)
+#   0 = 回退"Tag主导+HSV己方避让"混合 (Tag漏检己方块时HSV兜底发F防撞己方)
+# 取舍: 纯Tag下若Tag偶尔漏检己方块(角度/遮挡/运动模糊)将无避让兜底; 强依赖Tag后端正常。
+# 赛场Tag翻车 → 设 VISION_TAG_PURE=0 一键回退混合模式, 无需改代码。
+TAG_PURE = os.environ.get('VISION_TAG_PURE', '1') != '0'
 TAG_BACKEND = os.environ.get('VISION_TAG_BACKEND', 'apriltag')  # apriltag(推荐)/aruco/qr
 TAG_ID_NEUTRAL = 0   # 中立能量块
 TAG_ID_BLUE = 1      # 蓝方能量块

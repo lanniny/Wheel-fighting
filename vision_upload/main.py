@@ -330,6 +330,7 @@ class VisionSystem:
         print('-' * 55)
 
         print(f'TagPrime: {"ON" if getattr(config, "TAG_PRIMARY", True) else "OFF"}')
+        print(f'TagPure : {"ON (纯Tag, 无HSV保底)" if getattr(config, "TAG_PURE", True) else "OFF (Tag+HSV己方避让)"}')
         print(f'Adaptive: {"ON" if self._adaptive_hsv else "OFF"}')
         print(f'Holdover: frames={self._holdover_max} decay={self._holdover_decay}')
         print(f'PriScore: area_w={getattr(config, "PRIORITY_AREA_WEIGHT", 0.6)}'
@@ -339,6 +340,12 @@ class VisionSystem:
                         self.comm.my_color,
                         getattr(config, 'PRIORITY_MODE', 'collect'))
 
+        # 硬看门狗(2026-05-29): 独立线程监控主循环心跳。相机 cap.read() 阻塞hang时
+        # 主循环僵死(主循环内的软watchdog救不了、Restart=always也不触发因进程没退出),
+        # 由此线程强制 os._exit → systemd 拉起。根治"相机hang→视觉僵死→机器人失视觉乱撞"。
+        self._loop_heartbeat = time.time()
+        self._start_hang_watchdog()
+
         frame_idx = 0
         frame_dt = 1.0 / max(1, config.TARGET_FPS)
         next_frame = time.perf_counter()
@@ -346,6 +353,7 @@ class VisionSystem:
         try:
             while self._running:
                 t0 = time.perf_counter()
+                self._loop_heartbeat = time.time()  # 硬看门狗心跳: 主循环每轮刷新
 
                 # 1. UART 读命令 (必须在摄像头读帧之前, 因为 V4L2 select()
                 #    可能阻塞 10 秒, 期间 UART 完全不可用)
@@ -617,15 +625,21 @@ class VisionSystem:
                     else:
                         tags = self._last_tags
                 elif getattr(config, 'TAG_PRIMARY', True):
-                    # ── Tag-Primary: Tag + 己方色HSV(仅友方回避) ──
+                    # ── Tag-Primary: Tag 决策 (+可选 HSV 己方避让保底) ──
                     # STM32 只处理 F(后退), E/N/X 不区分
-                    # 视觉唯一任务: 检测己方块 → 发 F
-                    # Tag: 任何可见 Tag → 精确判断类型
-                    # HSV: 仅检测己方颜色 → 补充 Tag 角度盲区
-                    own_targets = self.detector.detect_own(
-                        frame, self.comm.my_color)
-                    n_own = len(own_targets)
-                    pt = own_targets[0] if own_targets else None
+                    # Tag: 任何可见 Tag → 精确判断类型 (己方F优先)
+                    # HSV己方保底: 仅 TAG_PURE=0 时启用 (补 Tag 角度盲区)
+                    if getattr(config, 'TAG_PURE', True):
+                        # 纯Tag模式(2026-05-29): 二维码已足够准确, 不跑HSV己方检测。
+                        # own_targets=[] 使下游 B1/HSV-F兜底分支自动失效 → 纯Tag决策, 省HSV~15ms。
+                        own_targets = []
+                        n_own = 0
+                        pt = None
+                    else:
+                        own_targets = self.detector.detect_own(
+                            frame, self.comm.my_color)
+                        n_own = len(own_targets)
+                        pt = own_targets[0] if own_targets else None
 
                     if self.tag_detector is not None:
                         tags = self.tag_detector.detect_tags(frame)
@@ -1019,6 +1033,40 @@ class VisionSystem:
             self.comm.close()
             det_logger.info('=== Vision stopped ===')
             print('Vision system stopped.')
+
+    def _start_hang_watchdog(self):
+        """启动独立硬看门狗线程。
+        主循环卡死(典型: 相机 cap.read() 阻塞 hang)时, 主循环内的软 watchdog
+        执行不到、systemd Restart=always 也不触发(进程未退出)。本线程独立运行,
+        检测到主循环心跳超时即 os._exit(1), 交给 systemd Restart=always 重启恢复。
+        """
+        timeout = getattr(config, 'CAMERA_HANG_TIMEOUT', 6.0)
+
+        def _loop():
+            while self._running:
+                time.sleep(1.0)
+                if not self._running:
+                    break
+                hb = self._loop_heartbeat
+                if hb <= 0:
+                    continue
+                age = time.time() - hb
+                if age > timeout:
+                    print(f'\n[HANG-WATCHDOG] 主循环 {age:.1f}s 无心跳 '
+                          f'(疑似相机hang), 强制退出由 systemd 重启',
+                          flush=True)
+                    try:
+                        det_logger.error(
+                            'HANG_WATCHDOG force exit: no heartbeat %.1fs', age)
+                    except Exception:
+                        pass
+                    os._exit(1)
+
+        self._hang_watchdog_thread = threading.Thread(
+            target=_loop, daemon=True, name='hang-watchdog')
+        self._hang_watchdog_thread.start()
+        print(f'[HANG-WATCHDOG] 已启动 (心跳超时 {timeout:.0f}s → 强制重启)',
+              flush=True)
 
     def _clear_tracker(self):
         """清空 Tracker 旧轨迹 (掉台进出 / 模式切换时调用)"""
