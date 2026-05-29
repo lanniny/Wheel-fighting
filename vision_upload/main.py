@@ -483,7 +483,33 @@ class VisionSystem:
                             self._drop_confirm_count = 0
 
                     ratio_pct = int(ratio * 100)
-                    if self._drop_sending_G:
+                    # 达令需求(2026-05-30): 掉台状态识别己方近块发F避让, 防"卡DROP→撞己方"。
+                    # 烛复核修正(CHANGES_REQUESTED): F必须加条件, 否则破坏回台——STM32 Backup
+                    # 只认连续G确认压墙(robot_backup.c:113-132), F/X插帧会清零G计数且F无避让语义。
+                    # 故仅在"疑似已上台卡DROP"(未发G + ratio<th_low)时才检测Tag发F避让;
+                    # 真冲台(_drop_sending_G)时保持G优先, 且此时不跑Tag(省全帧检测耗时防超时)。
+                    # F候选取最大面积(最强), 不取detect_tags首个(其顺序非策略定义)。
+                    drop_tag_f = None
+                    if (not self._drop_sending_G and ratio < th_low
+                            and self.tag_detector is not None):
+                        own_fs = [
+                            tg for tg in self.tag_detector.detect_tags(frame)
+                            if TagDetector.classify_tag(
+                                tg['id'], self.comm.my_color) == 'F']
+                        if own_fs:
+                            drop_tag_f = max(own_fs,
+                                             key=lambda t: t.get('area', 0))
+                    if drop_tag_f is not None:
+                        # 已上台卡DROP + 己方近块: 发F避让(防撞己方)
+                        fdir = (drop_tag_f['cx'] - config.CAMERA_WIDTH / 2) \
+                            / (config.CAMERA_WIDTH / 2)
+                        if getattr(config, 'DIRECTION_FLIP', False):
+                            fdir = -fdir
+                        self.comm.force_send_now()
+                        self.comm.send_target('F', drop_tag_f['cx'],
+                                               drop_tag_f['cy'],
+                                               drop_tag_f.get('area', 0), fdir)
+                    elif self._drop_sending_G:
                         self.comm.send_target('G', bcx, bcy, ratio_pct, bdir)
                     else:
                         # CRITICAL: 掉台等G阶段发X必须≥20Hz(50ms),
@@ -502,7 +528,8 @@ class VisionSystem:
                     echo_lag = self.comm.echo_latency_ms
 
                     # 日志
-                    g_status = 'G' if self._drop_sending_G else 'X'
+                    g_status = ('F' if drop_tag_f is not None
+                                else 'G' if self._drop_sending_G else 'X')
                     det_logger.info(
                         'DROP send=%s ratio=%d%% blob=%d%% cx=%d dir=%+.2f '
                         'cfm=%d/%d echo=%s %.0fms',
