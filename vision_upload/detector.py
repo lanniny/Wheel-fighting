@@ -848,12 +848,18 @@ class TagDetector:
         每个 Tag: {'id': int|str, 'cx': int, 'cy': int, 'area': int}
         """
         if self.backend == 'qr':
-            return self._detect_qr(frame)
+            tags = self._detect_qr(frame)
         elif self.backend == 'aruco':
-            return self._detect_aruco(frame)
+            tags = self._detect_aruco(frame)
         elif self.backend == 'apriltag':
-            return self._detect_apriltag(frame)
-        return []
+            tags = self._detect_apriltag(frame)
+        else:
+            return []
+        # 距离上限(2026-05-29): area<TAG_MIN_AREA 视为太远→忽略(只检测够近的Tag)
+        min_area = getattr(config, 'TAG_MIN_AREA', 0)
+        if min_area > 0:
+            tags = [t for t in tags if t.get('area', 0) >= min_area]
+        return tags
 
     def detect_tags_in_rois(self, frame, targets):
         """在颜色目标的 ROI 区域内检测 Tag (比全帧快很多)。

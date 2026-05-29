@@ -360,6 +360,10 @@ TAG_ID_YELLOW = 2    # 黄方能量块
 TAG_ROI_MARGIN = int(os.environ.get('VISION_TAG_ROI_MARGIN', '40'))    # ROI扩展边距(px), 颜色目标周围搜Tag
 TAG_ROI_MATCH_DIST = int(os.environ.get('VISION_TAG_MATCH_DIST', '50'))  # Tag-颜色匹配最大距离(px), 80→50 收紧避免方向偏差
 TAG_DECISION_MARGIN = float(os.environ.get('VISION_TAG_MARGIN', '30'))  # AprilTag decision_margin 最小值, 低于此值不信任
+# Tag距离上限(2026-05-29): area < 此值视为"太远", 忽略。area(角点tw*th)是距离代理, 越近越大。
+# 实测极限距离(蓝块)area≈1564~1610; 设1500留余量→此距离稳定检测, 更远(area<1500)不检测。
+# 设0=不限距离(检测所有可见Tag)。赛场调远近: 想更近设大(如3000), 想更远设小。
+TAG_MIN_AREA = int(os.environ.get('VISION_TAG_MIN_AREA', '1500'))
 ORPHAN_TAG_EDGE_MARGIN = int(os.environ.get('VISION_TAG_EDGE_MARGIN', '60'))  # 孤儿Tag边缘排除区(px), 防场外Tag误导
 
 # ============ Tag 辅助自适应 HSV (TAHSV) ============
