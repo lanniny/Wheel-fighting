@@ -297,7 +297,7 @@ CLOSE_RANGE_RATIO = float(os.environ.get('VISION_CLOSE_RATIO', '0.40'))  # 近�
 HSV_BLACK = {
     'lower': np.array([0, 0, 0]),
     'upper': np.array([180,
-                       int(os.environ.get('VISION_BLACK_S_MAX', '100')),
+                       int(os.environ.get('VISION_BLACK_S_MAX', '255')),  # 100→255(2026-05-29): 外壁暗但高饱和(实测S p50=159), S<100把外壁全排除致冲台ratio=0%; 放开S让"暗即黑", 外壁黑色比例→60%可发G
                        int(os.environ.get('VISION_BLACK_V_MAX', '60'))]),
 }
 # 迟滞阈值: ratio > HIGH → 开始发G, ratio < LOW → 停止发G, 防止 G↔X 震荡
