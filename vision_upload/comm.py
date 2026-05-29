@@ -218,7 +218,10 @@ class UartComm:
             self._p_received_ts = time.time()
             return ch
         if ch == 'D':
-            self.drop_recovery = True
+            # 2026-05-30: 纯光电判断上台后, 视觉不做掉台冲台检测。默认禁用DROP——
+            # 收到#D也不进DROP, 视觉永远正常Tag上台检测。VISION_DROP_ENABLED=1 可恢复。
+            if getattr(config, 'DROP_RECOVERY_ENABLED', False):
+                self.drop_recovery = True
             return ch
         if ch == 'c':
             self.mode = 'collect'

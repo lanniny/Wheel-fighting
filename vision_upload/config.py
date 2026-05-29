@@ -294,6 +294,11 @@ DIRECTION_FLIP = os.environ.get('VISION_DIR_FLIP', '0') != '0'  # 方向翻转 (
 CLOSE_RANGE_RATIO = float(os.environ.get('VISION_CLOSE_RATIO', '0.40'))  # 近距离回退占比阈值
 
 # ============ 掉台回复 - 黑色(台面)检测 ============
+# 掉台冲台检测总开关(2026-05-30): 默认False=禁用。纯光电判断上台后, 视觉不做掉台冲台
+# 黑色检测(不发G)、收到STM32的#D也不进DROP, 永远跑正常Tag上台检测(识别能量块F/E/N/X)。
+# 上台后避让己方由正常模式己方Tag避让保留。设 VISION_DROP_ENABLED=1 可恢复掉台检测。
+DROP_RECOVERY_ENABLED = os.environ.get('VISION_DROP_ENABLED', '0') != '0'
+
 HSV_BLACK = {
     'lower': np.array([0, 0, 0]),
     'upper': np.array([180,
