@@ -233,10 +233,6 @@ def _find_uart():
 # v2 (B5): UART_PORT 改 lazy 探测 - 见 __getattr__
 UART_BAUD = 115200
 UART_TIMEOUT = 0.005  # 读超时 10ms→5ms, 减少阻塞
-# UART握手开关(2026-05-30): 默认False。视觉收D/S回$d/$s确认, STM32收到确认才停发(防丢)。
-# ⚠️ 烛复核: 必须STM32端先改好(vision_parser识别d/s旁路 + robot_control重发-等-ack状态机)
-# 再开此开关; 否则STM32会把 $d/$s 当成目标(type='d'/'s',valid=1)污染。两端齐了设 VISION_HANDSHAKE=1。
-HANDSHAKE_ENABLED = os.environ.get('VISION_HANDSHAKE', '0') != '0'
 
 # ============ 图像预处理 ============
 USE_CLAHE = os.environ.get('VISION_CLAHE', '1') != '0'
@@ -298,11 +294,6 @@ DIRECTION_FLIP = os.environ.get('VISION_DIR_FLIP', '0') != '0'  # 方向翻转 (
 CLOSE_RANGE_RATIO = float(os.environ.get('VISION_CLOSE_RATIO', '0.40'))  # 近距离回退占比阈值
 
 # ============ 掉台回复 - 黑色(台面)检测 ============
-# 掉台冲台检测总开关(2026-05-30): 默认True=启用(现场实测仍需视觉上台, 2026-05-30回退)。
-# 启用: 收到STM32的#D进DROP做黑色检测发G辅助冲台上台(+已上台卡DROP时己方Tag避让)。
-# 设 VISION_DROP_ENABLED=0 可禁用(改纯光电上台, 视觉只做正常Tag识别)。
-DROP_RECOVERY_ENABLED = os.environ.get('VISION_DROP_ENABLED', '1') != '0'
-
 HSV_BLACK = {
     'lower': np.array([0, 0, 0]),
     'upper': np.array([180,
@@ -310,7 +301,7 @@ HSV_BLACK = {
                        int(os.environ.get('VISION_BLACK_V_MAX', '60'))]),
 }
 # 迟滞阈值: ratio > HIGH → 开始发G, ratio < LOW → 停止发G, 防止 G↔X 震荡
-DROP_BLACK_RATIO_HIGH = float(os.environ.get('VISION_DROP_RATIO_HIGH', '0.45'))  # G 启动阈值 (0.55→0.45 2026-05-30现场标定: DROP下黑墙ratio≈60%发G/台面≈20%不发G, 45%卡两者正中区分干净余量足)
+DROP_BLACK_RATIO_HIGH = float(os.environ.get('VISION_DROP_RATIO_HIGH', '0.45'))  # G 启动阈值 (现场标定0.45: 黑墙≈60%发G/台面≈20%不发G)
 DROP_BLACK_RATIO_LOW = float(os.environ.get('VISION_DROP_RATIO_LOW', '0.30'))    # G 退出阈值
 DROP_BLACK_RATIO_THRESHOLD = DROP_BLACK_RATIO_HIGH  # 兼容旧引用
 DROP_G_CONFIRM_FRAMES = _safe_int('VISION_DROP_CONFIRM', 5)
