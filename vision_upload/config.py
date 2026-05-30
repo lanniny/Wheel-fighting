@@ -310,7 +310,7 @@ HSV_BLACK = {
                        int(os.environ.get('VISION_BLACK_V_MAX', '60'))]),
 }
 # 迟滞阈值: ratio > HIGH → 开始发G, ratio < LOW → 停止发G, 防止 G↔X 震荡
-DROP_BLACK_RATIO_HIGH = float(os.environ.get('VISION_DROP_RATIO_HIGH', '0.55'))  # G 启动阈值 (0.50→0.55, 降低阴影误触发)
+DROP_BLACK_RATIO_HIGH = float(os.environ.get('VISION_DROP_RATIO_HIGH', '0.45'))  # G 启动阈值 (0.55→0.45 2026-05-30现场标定: DROP下黑墙ratio≈60%发G/台面≈20%不发G, 45%卡两者正中区分干净余量足)
 DROP_BLACK_RATIO_LOW = float(os.environ.get('VISION_DROP_RATIO_LOW', '0.30'))    # G 退出阈值
 DROP_BLACK_RATIO_THRESHOLD = DROP_BLACK_RATIO_HIGH  # 兼容旧引用
 DROP_G_CONFIRM_FRAMES = _safe_int('VISION_DROP_CONFIRM', 5)
