@@ -198,6 +198,31 @@ class UartComm:
         return f'{cs:02X}'
 
     # ------------------------------------------------------------------
+    # 内部: 握手确认 (2026-05-30)
+    # ------------------------------------------------------------------
+    def _send_ack(self, ack_ch):
+        """收到STM32的D/S后立即回确认标志位, STM32收到确认才停止重发(否则一直发)。
+        ack_ch: 'd'=确认收到D(进掉台), 's'=确认收到S(退掉台)。
+        发 $<ack>*CS\\n; STM32需识别小写d/s为确认(不当目标type处理)。
+        ⚠️ 默认关(HANDSHAKE_ENABLED=False): STM32端未接前不发ack, 防$d/$s被当目标污染。
+        """
+        if not getattr(config, 'HANDSHAKE_ENABLED', False):
+            return
+        if not self.ser:
+            return
+        try:
+            cs = self._checksum(ack_ch)
+            self.ser.write(f'${ack_ch}*{cs}\n'.encode())
+            # 握手日志(限频每10次1条, 防STM32持续发时刷屏): 对账用
+            n = getattr(self, '_ack_n', 0) + 1
+            self._ack_n = n
+            if n % 10 == 1:
+                print(f'[HANDSHAKE] 收到 {ack_ch.upper()} → 回确认 ${ack_ch} '
+                      f'给STM32 (#{n})', flush=True)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # 内部: 单字节命令解析
     # ------------------------------------------------------------------
     def _parse_cmd_byte(self, ch):
@@ -211,7 +236,9 @@ class UartComm:
         if ch == 's' or ch == 'S':
             self.active = True
             self.drop_recovery = False
-            return ch  # 2026-05-29: 保留原始大小写(s=开始/S=掉台恢复, 语义未来可区分)
+            if ch == 'S':
+                self._send_ack('s')  # 握手: 回S确认(掉台恢复), STM32收到才停发S
+            return ch
         if ch == 'p':
             print('[UART] WARNING: received p cmd → active=False (noise?)', flush=True)
             self.active = False
@@ -222,6 +249,7 @@ class UartComm:
             # 收到#D也不进DROP, 视觉永远正常Tag上台检测。VISION_DROP_ENABLED=1 可恢复。
             if getattr(config, 'DROP_RECOVERY_ENABLED', False):
                 self.drop_recovery = True
+            self._send_ack('d')  # 握手: 回D确认, STM32收到才停发D(否则一直发)
             return ch
         if ch == 'c':
             self.mode = 'collect'
